@@ -196,6 +196,9 @@ pub enum Subcommands {
 
         #[arg(help = "Number of parallel threads. Smoothing is parallelized across query sequences (each thread smooths one sequence at a time). 1 = the streaming single-threaded path.", short = 't', long = "n-threads", default_value = "4")]
         n_threads: usize,
+
+        #[arg(help = "Do not preserve input order in the output. With more than one thread, each sequence's smoothed intervals are emitted as soon as its worker finishes (completion order) instead of input order. Faster and lower-memory for inputs with many short sequences (e.g. reads), where order is irrelevant. Has no effect with a single thread.", long = "no-preserve-order", action = clap::ArgAction::SetTrue)]
+        no_preserve_order: bool,
     },
 
     #[command(arg_required_else_help = true, about = "Simple reference implementation for debugging this program.")]
@@ -810,7 +813,7 @@ fn main() {
             }
         },
 
-        Subcommands::Smooth { hierarchy, input, output, max_gap, n_threads } => {
+        Subcommands::Smooth { hierarchy, input, output, max_gap, n_threads, no_preserve_order } => {
             let (tree, names) = read_hierarchy_file(&hierarchy, &[]);
             let root_id = tree.root();
 
@@ -830,9 +833,13 @@ fn main() {
             // n_threads == 1 keeps the low-memory streaming path; > 1 parallelizes
             // smoothing across query sequences (byte-identical output).
             let stats = if n_threads <= 1 {
+                // Single thread: the streaming path is already order-preserving
+                // and lowest-memory, so --no-preserve-order has nothing to add.
                 smooth::run_smooth(input, output, &tree, &names, root_id, max_gap)
             } else {
-                smooth::run_smooth_parallel(input, output, &tree, &names, root_id, max_gap, n_threads)
+                smooth::run_smooth_parallel(
+                    input, output, &tree, &names, root_id, max_gap, n_threads, !no_preserve_order,
+                )
             };
             log::info!(
                 "Reads processed: {}, Intervals in: {}, Smoothed: {}, Merged: {}, Intervals out: {}",
