@@ -191,7 +191,7 @@ pub enum Subcommands {
         #[arg(help = "Output file. Defaults to stdout.", short, long)]
         output: Option<PathBuf>,
 
-        #[arg(help = "Maximum coordinate gap between adjacent intervals considered connected during smoothing.", long = "max-gap", default_value = "0")]
+        #[arg(help = "Maximum coordinate gap between adjacent intervals considered connected during smoothing.", long = "max-gap", default_value = "1000")]
         max_gap: u64,
 
         #[arg(help = "Number of parallel threads. Smoothing is parallelized across query sequences (each thread smooths one sequence at a time). 1 = the streaming single-threaded path.", short = 't', long = "n-threads", default_value = "4")]
@@ -830,17 +830,12 @@ fn main() {
                 Box::new(std::io::stdout())
             };
 
-            // n_threads == 1 keeps the low-memory streaming path; > 1 parallelizes
-            // smoothing across query sequences (byte-identical output).
-            let stats = if n_threads <= 1 {
-                // Single thread: the streaming path is already order-preserving
-                // and lowest-memory, so --no-preserve-order has nothing to add.
-                smooth::run_smooth(input, output, &tree, &names, root_id, max_gap)
-            } else {
-                smooth::run_smooth_parallel(
-                    input, output, &tree, &names, root_id, max_gap, n_threads, !no_preserve_order,
-                )
-            };
+            // Single streaming entry point for every thread count. n_threads == 1
+            // is the low-memory single-threaded path; > 1 parallelizes smoothing
+            // across query sequences (byte-identical output in preserve-order mode).
+            let stats = smooth::run_smooth(
+                input, output, &tree, &names, root_id, max_gap, n_threads, !no_preserve_order,
+            );
             log::info!(
                 "Reads processed: {}, Intervals in: {}, Smoothed: {}, Merged: {}, Intervals out: {}",
                 stats.reads_processed, stats.intervals_in, stats.intervals_smoothed,

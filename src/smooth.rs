@@ -5,7 +5,7 @@
 //! hierarchy and reassigns interior intervals to the LCA of the flanking anchors.
 
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Read, Write};
 
 use crate::lca_tree::LcaTree;
 
@@ -269,113 +269,6 @@ fn format_feature(
     }
 }
 
-/// Flush a completed query: smooth → merge → write.
-fn flush_query(
-    query_id: &str,
-    buf: &mut Vec<Interval>,
-    tree: &LcaTree,
-    names: &[String],
-    root_id: usize,
-    uses_names: bool,
-    max_gap: u64,
-    writer: &mut impl Write,
-    stats: &mut SmoothStats,
-) {
-    let n_in = buf.len() as u64;
-    let reassigned = smooth_intervals(buf, tree, max_gap);
-    let (merged, eliminated) = merge_intervals(std::mem::take(buf));
-    let n_out = merged.len() as u64;
-
-    for iv in &merged {
-        let feat_str = format_feature(iv.feature, iv.originally_none, names, root_id, uses_names);
-        writeln!(writer, "{}\t{}\t{}\t{}", query_id, iv.start, iv.end, feat_str)
-            .expect("write error");
-    }
-
-    stats.reads_processed += 1;
-    stats.intervals_in += n_in;
-    stats.intervals_smoothed += reassigned;
-    stats.intervals_merged += eliminated;
-    stats.intervals_out += n_out;
-}
-
-/// Run the smoothing pipeline on TSV input.
-pub fn run_smooth(
-    input: impl Read,
-    output: impl Write,
-    tree: &LcaTree,
-    names: &[String],
-    root_id: usize,
-    max_gap: u64,
-) -> SmoothStats {
-    // Build name → id lookup
-    let name_to_id: std::collections::HashMap<String, usize> = names.iter()
-        .enumerate()
-        .map(|(id, name)| (name.clone(), id))
-        .collect();
-
-    let reader = BufReader::new(input);
-    let mut writer = BufWriter::new(output);
-    let mut stats = SmoothStats::default();
-    let mut buf: Vec<Interval> = Vec::new();
-    let mut current_query = String::new();
-    let mut uses_names = false; // determined from header
-    let mut header_seen = false;
-
-    for line in reader.lines() {
-        let line = line.expect("IO error reading input");
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // Parse header
-        if !header_seen {
-            if trimmed.starts_with("query_rank") || trimmed.starts_with("query_name") {
-                header_seen = true;
-                uses_names = trimmed.contains("label_name");
-                // Pass header through
-                writeln!(writer, "{}", trimmed).expect("write error");
-                continue;
-            }
-            // No header line — treat as data
-            header_seen = true;
-        }
-
-        let mut cols = trimmed.splitn(4, '\t');
-        let query_id = cols.next().expect("missing query column");
-        let start: u64 = cols.next()
-            .and_then(|s| s.parse().ok())
-            .expect("bad start coordinate");
-        let end: u64 = cols.next()
-            .and_then(|s| s.parse().ok())
-            .expect("bad end coordinate");
-        let feat_token = cols.next().expect("missing feature column");
-
-        let (feature, originally_none) = resolve_feature(feat_token, &name_to_id, root_id, uses_names);
-
-        // Flush on query boundary
-        if query_id != current_query {
-            if !buf.is_empty() {
-                log::info!("Smoothing {}", current_query);
-                flush_query(&current_query, &mut buf, tree, names, root_id, uses_names, max_gap, &mut writer, &mut stats);
-            }
-            current_query = query_id.to_string();
-        }
-
-        buf.push(Interval { start, end, feature, originally_none });
-    }
-
-    // Flush final query
-    if !buf.is_empty() {
-        log::info!("Smoothing {}", current_query);
-        flush_query(&current_query, &mut buf, tree, names, root_id, uses_names, max_gap, &mut writer, &mut stats);
-    }
-
-    writer.flush().expect("flush error");
-    stats
-}
-
 impl SmoothStats {
     /// Fold one group's partial stats into this accumulator.
     fn merge(&mut self, o: &SmoothStats) {
@@ -627,12 +520,16 @@ fn dispatch_batch<W: Write>(
 /// Two output-ordering modes:
 ///
 /// * `preserve_order == true` (assemblies: few, long sequences where output
-///   order must match the input) — byte-for-byte identical to [`run_smooth`].
+///   order must match the input) — output is byte-identical regardless of
+///   `n_threads`, so `n_threads == 1` is the canonical reference result.
 /// * `preserve_order == false` (reads: many short sequences where order is
 ///   irrelevant) — each batch streams out in completion order.
 ///
-/// `n_threads` controls the worker parallelism (a local rayon pool).
-pub fn run_smooth_parallel(
+/// `n_threads` controls the worker parallelism (a local rayon pool); it is
+/// clamped to at least 1. `n_threads == 1` is the low-memory single-threaded
+/// streaming path — there is deliberately no separate single-threaded function
+/// to keep in sync, only this one entry point.
+pub fn run_smooth(
     input: impl Read,
     output: impl Write,
     tree: &LcaTree,
@@ -642,6 +539,7 @@ pub fn run_smooth_parallel(
     n_threads: usize,
     preserve_order: bool,
 ) -> SmoothStats {
+    let n_threads = n_threads.max(1);
     // Read granularity and batch-dispatch thresholds. A batch closes at whichever
     // limit trips first, keeping peak memory near max_bytes + largest-single-group
     // + output regardless of total input size (the streaming property).
@@ -813,9 +711,9 @@ mod tests {
         assert_eq!(intervals[1].feature, a);
     }
 
-    /// The parallel pipeline must produce byte-identical output to the
-    /// sequential one across multiple queries (some needing promotion, one
-    /// with a `none` run, one single-interval).
+    /// Multi-threaded output must be byte-identical to the single-threaded
+    /// (`n_threads == 1`) reference across multiple queries (some needing
+    /// promotion, one with a `none` run, one single-interval).
     #[test]
     fn parallel_matches_sequential() {
         let tree = cousin_tree(); // B(0), C(1) → A(2) → root(3)
@@ -836,12 +734,12 @@ mod tests {
                      seq3\t0\t100\tA\n";
 
         let mut out_seq: Vec<u8> = Vec::new();
-        let s1 = run_smooth(input.as_bytes(), &mut out_seq, &tree, &names, root, 1000);
+        let s1 = run_smooth(input.as_bytes(), &mut out_seq, &tree, &names, root, 1000, 1, true);
 
         for nt in [1usize, 2, 4] {
             let mut out_par: Vec<u8> = Vec::new();
             let s2 =
-                run_smooth_parallel(input.as_bytes(), &mut out_par, &tree, &names, root, 1000, nt, true);
+                run_smooth(input.as_bytes(), &mut out_par, &tree, &names, root, 1000, nt, true);
             assert_eq!(out_seq, out_par, "parallel output differs at n_threads={nt}");
             assert_eq!(s1.reads_processed, s2.reads_processed);
             assert_eq!(s1.intervals_in, s2.intervals_in);
@@ -873,9 +771,9 @@ mod tests {
                      seq3\t0\t100\tA\n";
 
         let mut out_seq: Vec<u8> = Vec::new();
-        run_smooth(input.as_bytes(), &mut out_seq, &tree, &names, root, 1000);
+        run_smooth(input.as_bytes(), &mut out_seq, &tree, &names, root, 1000, 1, true);
         let mut out_un: Vec<u8> = Vec::new();
-        run_smooth_parallel(input.as_bytes(), &mut out_un, &tree, &names, root, 1000, 4, false);
+        run_smooth(input.as_bytes(), &mut out_un, &tree, &names, root, 1000, 4, false);
 
         let seq = String::from_utf8(out_seq).unwrap();
         let un = String::from_utf8(out_un).unwrap();
@@ -914,18 +812,18 @@ mod tests {
         }
 
         let mut out_seq: Vec<u8> = Vec::new();
-        let s1 = run_smooth(input.as_bytes(), &mut out_seq, &tree, &names, root, 1000);
+        let s1 = run_smooth(input.as_bytes(), &mut out_seq, &tree, &names, root, 1000, 1, true);
 
         let mut out_ord: Vec<u8> = Vec::new();
         let s2 =
-            run_smooth_parallel(input.as_bytes(), &mut out_ord, &tree, &names, root, 1000, 4, true);
+            run_smooth(input.as_bytes(), &mut out_ord, &tree, &names, root, 1000, 4, true);
         assert_eq!(out_seq, out_ord, "ordered streaming output differs across batches");
         assert_eq!(s1.reads_processed, s2.reads_processed);
         assert_eq!(s1.reads_processed, 140000);
         assert_eq!(s1.intervals_smoothed, s2.intervals_smoothed);
 
         let mut out_un: Vec<u8> = Vec::new();
-        run_smooth_parallel(input.as_bytes(), &mut out_un, &tree, &names, root, 1000, 4, false);
+        run_smooth(input.as_bytes(), &mut out_un, &tree, &names, root, 1000, 4, false);
         let sorted = |b: &[u8]| {
             let s = String::from_utf8(b.to_vec()).unwrap();
             let mut v: Vec<String> = s.lines().skip(1).map(|x| x.to_string()).collect();
