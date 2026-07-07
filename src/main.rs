@@ -1,5 +1,14 @@
 #![allow(non_snake_case, clippy::needless_range_loop, clippy::len_zero)] // Using upper-case variable names from the source material
 
+// The default (glibc) allocator serializes catastrophically when many worker
+// threads each allocate/free per-group output buffers during `smooth`, causing
+// a severe slowdown at high thread counts (e.g. t16 ~7x slower than t4).
+// mimalloc's per-thread heaps eliminate the contention: `smooth` now scales
+// monotonically with threads (t16 becomes the fastest option). See the HKS
+// backend integration notes for the diagnostic that established this.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::{collections::HashMap, fs::File, io::{BufRead, BufReader, BufWriter, Write}, path::{Path, PathBuf}, sync::{Arc, Mutex}};
 use clap::{Parser, Subcommand};
 use io::{LazyFileSeqStream, SingleSeqStream};
