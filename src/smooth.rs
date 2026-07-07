@@ -368,7 +368,6 @@ struct SmoothCfg<'a> {
     name_to_id: &'a std::collections::HashMap<String, usize>,
     root_id: usize,
     max_gap: u64,
-    preserve_order: bool,
     max_groups: usize, // dispatch a batch once this many groups have closed …
     max_bytes: usize,  // … or once the closed groups reach this many bytes.
 }
@@ -441,10 +440,9 @@ impl Grouper {
 
 /// Smooth one batch of closed groups in parallel and write the output.
 ///
-/// * `preserve_order`: collect worker buffers and emit in input order (batches
-///   are processed strictly in sequence, so this is globally order-preserving).
-/// * otherwise: stream worker buffers out in completion order via a channel so
-///   the writer never blocks on a straggler within the batch.
+/// Worker buffers are collected and emitted in input order. Because batches are
+/// processed strictly in sequence, the output is globally order-preserving and
+/// byte-identical regardless of `n_threads`.
 fn dispatch_batch<W: Write>(
     pool: &rayon::ThreadPool,
     bytes: &[u8],
@@ -458,41 +456,20 @@ fn dispatch_batch<W: Write>(
     if ranges.is_empty() {
         return;
     }
-    if cfg.preserve_order {
-        let results: Vec<(SmoothStats, Vec<u8>)> = pool.install(|| {
-            ranges
-                .par_iter()
-                .map(|&(s, e)| {
-                    smooth_group(
-                        &bytes[s..e], cfg.tree, cfg.names, cfg.name_to_id, cfg.root_id,
-                        uses_names, cfg.max_gap,
-                    )
-                })
-                .collect()
-        });
-        for (st, out) in &results {
-            writer.write_all(out).expect("write error");
-            stats.merge(st);
-        }
-    } else {
-        std::thread::scope(|scope| {
-            let (tx, rx) = std::sync::mpsc::channel::<(SmoothStats, Vec<u8>)>();
-            scope.spawn(move || {
-                pool.install(|| {
-                    ranges.par_iter().for_each_with(tx, |tx, &(s, e)| {
-                        let res = smooth_group(
-                            &bytes[s..e], cfg.tree, cfg.names, cfg.name_to_id, cfg.root_id,
-                            uses_names, cfg.max_gap,
-                        );
-                        tx.send(res).expect("channel send error");
-                    });
-                });
-            });
-            for (st, out) in rx {
-                writer.write_all(&out).expect("write error");
-                stats.merge(&st);
-            }
-        });
+    let results: Vec<(SmoothStats, Vec<u8>)> = pool.install(|| {
+        ranges
+            .par_iter()
+            .map(|&(s, e)| {
+                smooth_group(
+                    &bytes[s..e], cfg.tree, cfg.names, cfg.name_to_id, cfg.root_id,
+                    uses_names, cfg.max_gap,
+                )
+            })
+            .collect()
+    });
+    for (st, out) in &results {
+        writer.write_all(out).expect("write error");
+        stats.merge(st);
     }
 }
 
@@ -517,13 +494,11 @@ fn dispatch_batch<W: Write>(
 /// thread and parallelised only the smoothing compute, capping speedup near
 /// ~1.4x regardless of thread count.
 ///
-/// Two output-ordering modes:
-///
-/// * `preserve_order == true` (assemblies: few, long sequences where output
-///   order must match the input) — output is byte-identical regardless of
-///   `n_threads`, so `n_threads == 1` is the canonical reference result.
-/// * `preserve_order == false` (reads: many short sequences where order is
-///   irrelevant) — each batch streams out in completion order.
+/// Output is written in input order and is byte-identical regardless of
+/// `n_threads`, so `n_threads == 1` is the canonical reference result. (An
+/// order-agnostic mode was measured to give no speedup even on long reads with a
+/// 3000x straggler ratio — rayon work-stealing over large batches already
+/// balances the load — so it was removed in favour of this single path.)
 ///
 /// `n_threads` controls the worker parallelism (a local rayon pool); it is
 /// clamped to at least 1. `n_threads == 1` is the low-memory single-threaded
@@ -537,7 +512,6 @@ pub fn run_smooth(
     root_id: usize,
     max_gap: u64,
     n_threads: usize,
-    preserve_order: bool,
 ) -> SmoothStats {
     let n_threads = n_threads.max(1);
     // Read granularity and batch-dispatch thresholds. A batch closes at whichever
@@ -567,7 +541,6 @@ pub fn run_smooth(
         name_to_id: &name_to_id,
         root_id,
         max_gap,
-        preserve_order,
         max_groups: BATCH_MAX_GROUPS,
         max_bytes: BATCH_MAX_BYTES,
     };
@@ -734,12 +707,12 @@ mod tests {
                      seq3\t0\t100\tA\n";
 
         let mut out_seq: Vec<u8> = Vec::new();
-        let s1 = run_smooth(input.as_bytes(), &mut out_seq, &tree, &names, root, 1000, 1, true);
+        let s1 = run_smooth(input.as_bytes(), &mut out_seq, &tree, &names, root, 1000, 1);
 
         for nt in [1usize, 2, 4] {
             let mut out_par: Vec<u8> = Vec::new();
             let s2 =
-                run_smooth(input.as_bytes(), &mut out_par, &tree, &names, root, 1000, nt, true);
+                run_smooth(input.as_bytes(), &mut out_par, &tree, &names, root, 1000, nt);
             assert_eq!(out_seq, out_par, "parallel output differs at n_threads={nt}");
             assert_eq!(s1.reads_processed, s2.reads_processed);
             assert_eq!(s1.intervals_in, s2.intervals_in);
@@ -748,51 +721,10 @@ mod tests {
         }
     }
 
-    /// In `--no-preserve-order` mode the output can appear in any per-sequence
-    /// order, but the header must be preserved and the *set* of data lines must
-    /// be identical to the sequential run.
-    #[test]
-    fn unordered_matches_sequential_as_set() {
-        let tree = cousin_tree();
-        let root = tree.root();
-        let names = vec![
-            "B".to_string(),
-            "C".to_string(),
-            "A".to_string(),
-            "root".to_string(),
-        ];
-        let input = "query_name\tfrom_kmer\tto_kmer\tlabel_name\n\
-                     seq1\t0\t100\tB\n\
-                     seq1\t100\t200\troot\n\
-                     seq1\t200\t300\tC\n\
-                     seq2\t0\t50\tnone\n\
-                     seq2\t50\t150\tB\n\
-                     seq2\t150\t250\tC\n\
-                     seq3\t0\t100\tA\n";
-
-        let mut out_seq: Vec<u8> = Vec::new();
-        run_smooth(input.as_bytes(), &mut out_seq, &tree, &names, root, 1000, 1, true);
-        let mut out_un: Vec<u8> = Vec::new();
-        run_smooth(input.as_bytes(), &mut out_un, &tree, &names, root, 1000, 4, false);
-
-        let seq = String::from_utf8(out_seq).unwrap();
-        let un = String::from_utf8(out_un).unwrap();
-        // Header identical and first.
-        assert_eq!(seq.lines().next(), un.lines().next(), "header differs");
-        // Data-line sets equal (order-insensitive).
-        let sorted = |s: &str| {
-            let mut v: Vec<&str> = s.lines().skip(1).collect();
-            v.sort_unstable();
-            v.join("\n")
-        };
-        assert_eq!(sorted(&seq), sorted(&un), "unordered data-line set differs");
-    }
-
     /// Force the streaming path across several batch dispatches: with far more
     /// query groups than `BATCH_MAX_GROUPS` (65536), `take_batch` fires mid-stream
-    /// multiple times. Ordered output must still be byte-identical to the
-    /// sequential run (proving batch boundaries preserve global order), and
-    /// unordered must match as a set.
+    /// multiple times. Output must still be byte-identical to the sequential run,
+    /// proving batch boundaries preserve global order.
     #[test]
     fn streaming_batches_preserve_order() {
         let tree = cousin_tree();
@@ -812,27 +744,14 @@ mod tests {
         }
 
         let mut out_seq: Vec<u8> = Vec::new();
-        let s1 = run_smooth(input.as_bytes(), &mut out_seq, &tree, &names, root, 1000, 1, true);
+        let s1 = run_smooth(input.as_bytes(), &mut out_seq, &tree, &names, root, 1000, 1);
 
         let mut out_ord: Vec<u8> = Vec::new();
         let s2 =
-            run_smooth(input.as_bytes(), &mut out_ord, &tree, &names, root, 1000, 4, true);
+            run_smooth(input.as_bytes(), &mut out_ord, &tree, &names, root, 1000, 4);
         assert_eq!(out_seq, out_ord, "ordered streaming output differs across batches");
         assert_eq!(s1.reads_processed, s2.reads_processed);
         assert_eq!(s1.reads_processed, 140000);
         assert_eq!(s1.intervals_smoothed, s2.intervals_smoothed);
-
-        let mut out_un: Vec<u8> = Vec::new();
-        run_smooth(input.as_bytes(), &mut out_un, &tree, &names, root, 1000, 4, false);
-        let sorted = |b: &[u8]| {
-            let s = String::from_utf8(b.to_vec()).unwrap();
-            let mut v: Vec<String> = s.lines().skip(1).map(|x| x.to_string()).collect();
-            v.sort_unstable();
-            v.join("\n")
-        };
-        assert_eq!(String::from_utf8(out_seq.clone()).unwrap().lines().next(),
-                   String::from_utf8(out_un.clone()).unwrap().lines().next(),
-                   "header differs");
-        assert_eq!(sorted(&out_seq), sorted(&out_un), "unordered set differs across batches");
     }
 }

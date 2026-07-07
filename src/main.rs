@@ -205,9 +205,6 @@ pub enum Subcommands {
 
         #[arg(help = "Number of parallel threads. Smoothing is parallelized across query sequences (each thread smooths one sequence at a time). 1 = the streaming single-threaded path.", short = 't', long = "n-threads", default_value = "4")]
         n_threads: usize,
-
-        #[arg(help = "Do not preserve input order in the output. With more than one thread, each sequence's smoothed intervals are emitted as soon as its worker finishes (completion order) instead of input order. Faster and lower-memory for inputs with many short sequences (e.g. reads), where order is irrelevant. Has no effect with a single thread.", long = "no-preserve-order", action = clap::ArgAction::SetTrue)]
-        no_preserve_order: bool,
     },
 
     #[command(arg_required_else_help = true, about = "Simple reference implementation for debugging this program.")]
@@ -822,7 +819,7 @@ fn main() {
             }
         },
 
-        Subcommands::Smooth { hierarchy, input, output, max_gap, n_threads, no_preserve_order } => {
+        Subcommands::Smooth { hierarchy, input, output, max_gap, n_threads } => {
             let (tree, names) = read_hierarchy_file(&hierarchy, &[]);
             let root_id = tree.root();
 
@@ -841,9 +838,9 @@ fn main() {
 
             // Single streaming entry point for every thread count. n_threads == 1
             // is the low-memory single-threaded path; > 1 parallelizes smoothing
-            // across query sequences (byte-identical output in preserve-order mode).
+            // across query sequences. Output is byte-identical for any thread count.
             let stats = smooth::run_smooth(
-                input, output, &tree, &names, root_id, max_gap, n_threads, !no_preserve_order,
+                input, output, &tree, &names, root_id, max_gap, n_threads,
             );
             log::info!(
                 "Reads processed: {}, Intervals in: {}, Smoothed: {}, Merged: {}, Intervals out: {}",
