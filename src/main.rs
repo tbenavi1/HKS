@@ -214,8 +214,8 @@ pub enum Subcommands {
 
 #[derive(Parser, Debug)]
 pub struct LookupQueryArgs {
-    #[arg(help = "A fasta/fastq query file", short, long, required = true)]
-    query: PathBuf,
+    #[arg(help = "A fasta/fastq query file. Repeatable: pass -q several times to run multiple query files against a single index load; pair each with a matching -o (in the same order).", short, long, required = true)]
+    query: Vec<PathBuf>,
 
     #[arg(help = "Print query names instead of query rank integers.", long = "report-query-names")]
     report_query_names: bool,
@@ -232,8 +232,8 @@ pub struct LookupQueryArgs {
     #[arg(help = "Report internal label id integers instead of label names. This might save a lot of space if the labels are long. Use --print-hierarchy to print the internal ids.", long = "report-label-ids", help_heading = "Advanced")]
     report_label_ids: bool,
 
-    #[arg(help = "Output file. Defaults to stdout.", short, long)]
-    output: Option<PathBuf>,
+    #[arg(help = "Output file. Defaults to stdout (only valid with a single -q). Repeatable: pass one -o per -q, in the same order.", short, long)]
+    output: Vec<PathBuf>,
 }
 
 
@@ -411,26 +411,56 @@ fn run_queries<A: ColoredKmerLookupAlgorithm + Send + Sync, W: RunWriter>(n_thre
 
 fn run_lookup_with_args(index: &ShortKColorIndex, n_threads: usize, args: &LookupQueryArgs) -> Result<(), String> {
     let k = index.query_k();
-    let seq_names = if args.report_query_names { Some(load_seq_names(&args.query)?) } else { None };
+
+    // Output arity: either omit --output entirely (single query -> stdout), or supply
+    // exactly one --output per --query, paired positionally. Writing several queries to a
+    // shared stdout would interleave unlabelled runs, so it is rejected.
+    if !args.output.is_empty() && args.output.len() != args.query.len() {
+        return Err(format!(
+            "Got {} --query file(s) but {} --output path(s); pass one -o per -q (in the same order), \
+             or omit -o entirely to write a single query to stdout.",
+            args.query.len(),
+            args.output.len()
+        ));
+    }
+    if args.output.is_empty() && args.query.len() > 1 {
+        return Err(
+            "Multiple -q query files require one -o per query; stdout can only carry a single query."
+                .to_string(),
+        );
+    }
+
+    // Label names are shared across queries; compute once, clone per output writer.
     let color_names: Option<Vec<String>> = if args.report_label_ids {
         None
     } else {
         Some(index.inner().labeling().hierarchy.names().to_vec())
     };
-    let reader = open_fastx(&args.query)?;
 
-    // A dynamic writer is fine performance-wise because it's wrapped in a buffered writer.
-    let out: Box<dyn Write + Send> = if let Some(ref path) = args.output {
-        Box::new(File::create(path).map_err(|e| format!("Could not create output file {}: {e}", path.display()))?)
-    } else {
-        Box::new(std::io::stdout())
-    };
-    let writer = OutputWriter::new(BufWriter::with_capacity(1 << 21, out), seq_names, color_names, args.report_misses, !args.no_header);
+    // The index is loaded once by the caller; each query reuses it.
+    for (i, query_path) in args.query.iter().enumerate() {
+        let seq_names = if args.report_query_names { Some(load_seq_names(query_path)?) } else { None };
+        let reader = open_fastx(query_path)?;
 
-    let algo = LookupAlgorithmImpl { index };
+        // A dynamic writer is fine performance-wise because it's wrapped in a buffered writer.
+        let out: Box<dyn Write + Send> = if let Some(path) = args.output.get(i) {
+            Box::new(File::create(path).map_err(|e| format!("Could not create output file {}: {e}", path.display()))?)
+        } else {
+            Box::new(std::io::stdout())
+        };
+        let writer = OutputWriter::new(
+            BufWriter::with_capacity(1 << 21, out),
+            seq_names,
+            color_names.clone(),
+            args.report_misses,
+            !args.no_header,
+        );
 
-    log::info!("Running queries from {} ...", args.query.display());
-    run_queries(n_threads, reader, &algo, args.batch_size as usize, k, writer);
+        let algo = LookupAlgorithmImpl { index };
+
+        log::info!("Running queries from {} ...", query_path.display());
+        run_queries(n_threads, reader, &algo, args.batch_size as usize, k, writer);
+    }
     Ok(())
 }
 
