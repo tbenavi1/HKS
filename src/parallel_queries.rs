@@ -15,17 +15,39 @@ impl<T: RunWriter + ?Sized> RunWriter for &mut T {
     fn flush(&mut self) { (**self).flush() }
 }
 
+/// The token written for a run of k-mers that is not in the index, when
+/// reporting label *names*. Numeric-id mode always writes `-` instead.
+pub const DEFAULT_MISS_LABEL: &str = "none";
+
+/// Output-format settings that `lookup` and `smooth` have to agree on.
+///
+/// They are grouped because they travel together and because `smooth` *parses*
+/// the same miss token it writes: pointing it at a `lookup` output produced
+/// with a different token would silently reinterpret every miss run as an
+/// unknown feature name. One type, one default, both subcommands.
+#[derive(Clone, Debug)]
+pub struct OutputFormat {
+    pub miss_label: String,
+    pub print_header: bool,
+}
+
+impl Default for OutputFormat {
+    fn default() -> Self {
+        Self { miss_label: DEFAULT_MISS_LABEL.to_string(), print_header: true }
+    }
+}
+
 pub struct OutputWriter<W: Write> {
     out: W,
     seq_names: Option<Vec<String>>,
     color_names: Option<Vec<String>>,
     report_misses: bool,
-    print_header: bool,
+    format: OutputFormat,
 }
 
 impl<W: Write> OutputWriter<W> {
-    pub fn new(out: W, seq_names: Option<Vec<String>>, color_names: Option<Vec<String>>, report_misses: bool, print_header: bool) -> Self {
-        Self { out, seq_names, color_names, report_misses, print_header }
+    pub fn new(out: W, seq_names: Option<Vec<String>>, color_names: Option<Vec<String>>, report_misses: bool, format: OutputFormat) -> Self {
+        Self { out, seq_names, color_names, report_misses, format }
     }
 
     #[cfg(test)]
@@ -36,7 +58,7 @@ impl<W: Write> OutputWriter<W> {
 
 impl<W: Write + Send> RunWriter for OutputWriter<W> {
     fn write_header(&mut self) {
-        if self.print_header {
+        if self.format.print_header {
             let seq_col = if self.seq_names.is_some() { "query_name" } else { "query_rank" };
             let color_col = if self.color_names.is_some() { "label_name" } else { "label" };
             writeln!(self.out, "{seq_col}\tfrom_kmer\tto_kmer\t{color_col}").unwrap();
@@ -56,7 +78,7 @@ impl<W: Write + Send> RunWriter for OutputWriter<W> {
         }
         write!(self.out, "\t{from}\t{to}\t").unwrap();
         match run_color {
-            None => write!(self.out, "{}", if self.color_names.is_some() { "none" } else { "-" }).unwrap(),
+            None => write!(self.out, "{}", if self.color_names.is_some() { self.format.miss_label.as_str() } else { "-" }).unwrap(),
             Some(c) => match &self.color_names {
                 Some(names) => write!(self.out, "{}", &names[c]).unwrap(),
                 None => write!(self.out, "{c}").unwrap(),
@@ -343,7 +365,7 @@ mod tests {
     use rand_chacha::rand_core::{RngCore, SeedableRng};
     use sbwt::{BitPackedKmerSortingMem, SeqStream};
 
-    use crate::{color_storage::SimpleColorStorage, parallel_queries::{OutputWriter, lookup_parallel}, single_colored_kmers::{ColorHierarchy, HksBase, HksIndex, Labeling, LcsWrapper}, traits::ColoredKmerLookupAlgorithm};
+    use crate::{color_storage::SimpleColorStorage, parallel_queries::{OutputFormat, OutputWriter, lookup_parallel}, single_colored_kmers::{ColorHierarchy, HksBase, HksIndex, Labeling, LcsWrapper}, traits::ColoredKmerLookupAlgorithm};
 
     struct HksIndexLookup<'a> {
         index: &'a HksIndex<LcsWrapper, SimpleColorStorage>,
@@ -492,7 +514,7 @@ mod tests {
 
         let out_vec = Vec::<u8>::new();
         let out = std::io::Cursor::new(out_vec);
-        let mut writer = OutputWriter::new(out, None, None, false, true);
+        let mut writer = OutputWriter::new(out, None, None, false, OutputFormat::default());
         let sck_lookup = HksIndexLookup { index: &sck };
         lookup_parallel(2, MultiSeqStream::new(queries.clone()), &sck_lookup, batch_size, k, &mut writer);
 
@@ -609,7 +631,7 @@ mod tests {
 
         let out_vec = Vec::<u8>::new();
         let out = std::io::Cursor::new(out_vec);
-        let mut writer = OutputWriter::new(out, None, None, false, true);
+        let mut writer = OutputWriter::new(out, None, None, false, OutputFormat::default());
         let sck_lookup = HksIndexLookup { index: &sck };
         lookup_parallel(2, MultiSeqStream::new(queries.clone()), &sck_lookup, batch_size, query_k, &mut writer);
 

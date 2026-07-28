@@ -15,7 +15,7 @@ use io::{LazyFileSeqStream, SingleSeqStream};
 use jseqio::{reader::DynamicFastXReader, record::Record};
 use sbwt::{BitPackedKmerSortingDisk, BitPackedKmerSortingMem, LcsArray, SbwtIndex, SbwtIndexVariant, SubsetMatrix, write_sbwt_index_variant};
 use single_colored_kmers::{ColorHierarchy, Labeling, HksIndex};
-use parallel_queries::OutputWriter;
+use parallel_queries::{OutputFormat, OutputWriter};
 
 use crate::{color_storage::SimpleColorStorage, parallel_queries::RunWriter, single_colored_kmers::{HksBase, LcsWrapper, SingleColoredKmersShort}, traits::{ColorStorage, ColoredKmerLookupAlgorithm}};
 
@@ -41,6 +41,10 @@ type ShortKColorIndex = SingleColoredKmersShort<LcsWrapper, SimpleColorStorage>;
 // The duplication exists because Rust's concat!() only accepts literals, so
 // we cannot build a compile-time string from this slice.
 static RESERVED_COLOR_NAMES: &[&str] = &["none"];
+
+// Shared by `lookup` and `smooth`: the option means the same thing in both, and
+// they have to agree on the value, so they document it identically.
+const MISS_LABEL_HELP: &str = "Token written for runs of k-mers that are not in the index, when reporting label names (numeric-id mode always writes '-'). `lookup` writes it and `smooth` both parses and rewrites it, so the two must be given the same value. Setting it to whatever a downstream tool calls 'absent' lets that tool consume the output directly instead of rewriting every miss line in a multi-gigabyte file.";
 
 #[derive(Parser)]
 #[command(arg_required_else_help = true)]
@@ -205,6 +209,12 @@ pub enum Subcommands {
 
         #[arg(help = "Number of parallel threads. Smoothing is parallelized across query sequences (each thread smooths one sequence at a time). 1 = the streaming single-threaded path.", short = 't', long = "n-threads", default_value = "4")]
         n_threads: usize,
+
+        #[arg(help = MISS_LABEL_HELP, long = "miss-label", default_value = parallel_queries::DEFAULT_MISS_LABEL)]
+        miss_label: String,
+
+        #[arg(help = "Do not print the header line.", long = "no-header")]
+        no_header: bool,
     },
 
     #[command(arg_required_else_help = true, about = "Simple reference implementation for debugging this program.")]
@@ -243,6 +253,9 @@ pub struct LookupQueryArgs {
 
     #[arg(help = "Output file. Defaults to stdout.", short, long)]
     output: Option<PathBuf>,
+
+    #[arg(help = MISS_LABEL_HELP, long = "miss-label", default_value = parallel_queries::DEFAULT_MISS_LABEL)]
+    miss_label: String,
 }
 
 
@@ -434,7 +447,10 @@ fn run_lookup_with_args(index: &ShortKColorIndex, n_threads: usize, args: &Looku
     } else {
         Box::new(std::io::stdout())
     };
-    let writer = OutputWriter::new(BufWriter::with_capacity(1 << 21, out), seq_names, color_names, args.report_misses, !args.no_header);
+    let writer = OutputWriter::new(
+        BufWriter::with_capacity(1 << 21, out), seq_names, color_names, args.report_misses,
+        OutputFormat { miss_label: args.miss_label.clone(), print_header: !args.no_header },
+    );
 
     let algo = LookupAlgorithmImpl { index };
 
@@ -819,7 +835,7 @@ fn main() {
             }
         },
 
-        Subcommands::Smooth { hierarchy, input, output, max_gap, n_threads } => {
+        Subcommands::Smooth { hierarchy, input, output, max_gap, n_threads, miss_label, no_header } => {
             let (tree, names) = read_hierarchy_file(&hierarchy, &[]);
             let root_id = tree.root();
 
@@ -841,6 +857,7 @@ fn main() {
             // across query sequences. Output is byte-identical for any thread count.
             let stats = smooth::run_smooth(
                 input, output, &tree, &names, root_id, max_gap, n_threads,
+                &OutputFormat { miss_label, print_header: !no_header },
             );
             log::info!(
                 "Reads processed: {}, Intervals in: {}, Smoothed: {}, Merged: {}, Intervals out: {}",

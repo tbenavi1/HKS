@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::io::{BufWriter, Read, Write};
 
 use crate::lca_tree::LcaTree;
+use crate::parallel_queries::OutputFormat;
 
 // ---------------------------------------------------------------------------
 // Interval representation
@@ -230,9 +231,10 @@ fn resolve_feature(
     name_to_id: &std::collections::HashMap<String, usize>,
     root_id: usize,
     uses_names: bool,
+    miss_label: &str,
 ) -> (usize, bool) {
     if uses_names {
-        if token == "none" {
+        if token == miss_label {
             (root_id, true)
         } else {
             let id = name_to_id.get(token)
@@ -258,10 +260,12 @@ fn format_feature(
     names: &[String],
     root_id: usize,
     uses_names: bool,
+    miss_label: &str,
 ) -> String {
     if originally_none && feature == root_id {
-        // Was none and smoothing didn't resolve it → keep as none
-        if uses_names { "none".to_string() } else { "-".to_string() }
+        // Was a miss and smoothing didn't resolve it → keep it a miss. The same
+        // token is used on input and output, so a round trip is lossless.
+        if uses_names { miss_label.to_string() } else { "-".to_string() }
     } else if uses_names {
         names[feature].to_string()
     } else {
@@ -297,6 +301,7 @@ fn smooth_group(
     root_id: usize,
     uses_names: bool,
     max_gap: u64,
+    miss_label: &str,
 ) -> (SmoothStats, Vec<u8>) {
     let mut query_id: &str = "";
     let mut have_qid = false;
@@ -325,7 +330,7 @@ fn smooth_group(
             .expect("bad end coordinate");
         let feat_token = std::str::from_utf8(feat_b).expect("non-UTF8 feature name");
 
-        let (feature, originally_none) = resolve_feature(feat_token, name_to_id, root_id, uses_names);
+        let (feature, originally_none) = resolve_feature(feat_token, name_to_id, root_id, uses_names, miss_label);
         intervals.push(Interval { start, end, feature, originally_none });
     }
 
@@ -341,7 +346,7 @@ fn smooth_group(
     // on the kernel's mmap lock and cause a hard regression at high thread counts.
     let mut out: Vec<u8> = Vec::new();
     for iv in &merged {
-        let feat_str = format_feature(iv.feature, iv.originally_none, names, root_id, uses_names);
+        let feat_str = format_feature(iv.feature, iv.originally_none, names, root_id, uses_names, miss_label);
         writeln!(out, "{}\t{}\t{}\t{}", query_id, iv.start, iv.end, feat_str)
             .expect("formatting error");
     }
@@ -368,6 +373,9 @@ struct SmoothCfg<'a> {
     name_to_id: &'a std::collections::HashMap<String, usize>,
     root_id: usize,
     max_gap: u64,
+    /// Token meaning "not in the index", both parsed from the input and written
+    /// back out, so a round trip through `smooth` is lossless.
+    miss_label: &'a str,
     max_groups: usize, // dispatch a batch once this many groups have closed …
     max_bytes: usize,  // … or once the closed groups reach this many bytes.
 }
@@ -462,7 +470,7 @@ fn dispatch_batch<W: Write>(
             .map(|&(s, e)| {
                 smooth_group(
                     &bytes[s..e], cfg.tree, cfg.names, cfg.name_to_id, cfg.root_id,
-                    uses_names, cfg.max_gap,
+                    uses_names, cfg.max_gap, cfg.miss_label,
                 )
             })
             .collect()
@@ -504,6 +512,9 @@ fn dispatch_batch<W: Write>(
 /// clamped to at least 1. `n_threads == 1` is the low-memory single-threaded
 /// streaming path — there is deliberately no separate single-threaded function
 /// to keep in sync, only this one entry point.
+/// `format` must match whatever produced the input: the miss token is parsed as
+/// well as written, so a mismatch would reinterpret every miss run as an unknown
+/// feature name.
 pub fn run_smooth(
     input: impl Read,
     output: impl Write,
@@ -512,7 +523,10 @@ pub fn run_smooth(
     root_id: usize,
     max_gap: u64,
     n_threads: usize,
+    format: &OutputFormat,
 ) -> SmoothStats {
+    let miss_label = format.miss_label.as_str();
+    let print_header = format.print_header;
     let n_threads = n_threads.max(1);
     // Read granularity and batch-dispatch thresholds. A batch closes at whichever
     // limit trips first, keeping peak memory near max_bytes + largest-single-group
@@ -541,6 +555,7 @@ pub fn run_smooth(
         name_to_id: &name_to_id,
         root_id,
         max_gap,
+        miss_label,
         max_groups: BATCH_MAX_GROUPS,
         max_bytes: BATCH_MAX_BYTES,
     };
@@ -573,9 +588,14 @@ pub fn run_smooth(
         if *first_content {
             *first_content = false;
             if line.starts_with(b"query_rank") || line.starts_with(b"query_name") {
+                // The header is always consumed -- it is what tells us whether
+                // the input uses names or numeric ids -- but only echoed when
+                // the caller wants one.
                 *uses_names = line.windows(b"label_name".len()).any(|w| w == b"label_name");
-                writer.write_all(line).expect("write error");
-                writer.write_all(b"\n").expect("write error");
+                if print_header {
+                    writer.write_all(line).expect("write error");
+                    writer.write_all(b"\n").expect("write error");
+                }
                 return;
             }
             // Not a header — fall through and treat this line as data.
@@ -707,12 +727,12 @@ mod tests {
                      seq3\t0\t100\tA\n";
 
         let mut out_seq: Vec<u8> = Vec::new();
-        let s1 = run_smooth(input.as_bytes(), &mut out_seq, &tree, &names, root, 1000, 1);
+        let s1 = run_smooth(input.as_bytes(), &mut out_seq, &tree, &names, root, 1000, 1, &OutputFormat::default());
 
         for nt in [1usize, 2, 4] {
             let mut out_par: Vec<u8> = Vec::new();
             let s2 =
-                run_smooth(input.as_bytes(), &mut out_par, &tree, &names, root, 1000, nt);
+                run_smooth(input.as_bytes(), &mut out_par, &tree, &names, root, 1000, nt, &OutputFormat::default());
             assert_eq!(out_seq, out_par, "parallel output differs at n_threads={nt}");
             assert_eq!(s1.reads_processed, s2.reads_processed);
             assert_eq!(s1.intervals_in, s2.intervals_in);
@@ -744,11 +764,11 @@ mod tests {
         }
 
         let mut out_seq: Vec<u8> = Vec::new();
-        let s1 = run_smooth(input.as_bytes(), &mut out_seq, &tree, &names, root, 1000, 1);
+        let s1 = run_smooth(input.as_bytes(), &mut out_seq, &tree, &names, root, 1000, 1, &OutputFormat::default());
 
         let mut out_ord: Vec<u8> = Vec::new();
         let s2 =
-            run_smooth(input.as_bytes(), &mut out_ord, &tree, &names, root, 1000, 4);
+            run_smooth(input.as_bytes(), &mut out_ord, &tree, &names, root, 1000, 4, &OutputFormat::default());
         assert_eq!(out_seq, out_ord, "ordered streaming output differs across batches");
         assert_eq!(s1.reads_processed, s2.reads_processed);
         assert_eq!(s1.reads_processed, 140000);
