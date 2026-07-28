@@ -569,7 +569,9 @@ pub fn run_smooth(
     let mut writer = BufWriter::new(output);
     let mut stats = SmoothStats::default();
     let mut grouper = Grouper::default();
-    let mut uses_names = false;
+    // What the caller says the input is. A header, if there is one, overrides
+    // this below -- the file describes itself better than a flag can.
+    let mut uses_names = !format.label_ids;
     let mut first_content = true;
 
     // Process one raw line (may span block boundaries): trim, drop blanks,
@@ -588,10 +590,20 @@ pub fn run_smooth(
         if *first_content {
             *first_content = false;
             if line.starts_with(b"query_rank") || line.starts_with(b"query_name") {
-                // The header is always consumed -- it is what tells us whether
-                // the input uses names or numeric ids -- but only echoed when
-                // the caller wants one.
-                *uses_names = line.windows(b"label_name".len()).any(|w| w == b"label_name");
+                // The header is always consumed, and it settles whether the
+                // input uses names or numeric ids -- it describes the file in
+                // hand, so it beats whatever --report-label-ids claimed. It is
+                // only echoed when the caller wants a header of their own.
+                let header_says_names = line.windows(b"label_name".len()).any(|w| w == b"label_name");
+                if header_says_names != *uses_names {
+                    log::warn!(
+                        "input header says the fourth column holds label {}, not label {} as \
+                         --report-label-ids implies; trusting the header",
+                        if header_says_names { "names" } else { "ids" },
+                        if header_says_names { "ids" } else { "names" },
+                    );
+                }
+                *uses_names = header_says_names;
                 if print_header {
                     writer.write_all(line).expect("write error");
                     writer.write_all(b"\n").expect("write error");
@@ -773,5 +785,100 @@ mod tests {
         assert_eq!(s1.reads_processed, s2.reads_processed);
         assert_eq!(s1.reads_processed, 140000);
         assert_eq!(s1.intervals_smoothed, s2.intervals_smoothed);
+    }
+
+    // --- headerless input ------------------------------------------------
+    //
+    // The header is what told `smooth` whether column four holds names or
+    // numeric ids. Once `lookup --no-header` became useful -- its output is
+    // then already in the shape a downstream tool wants, with no rewriting
+    // pass -- that signal is gone and `--report-label-ids` has to supply it.
+
+    fn names_fixture() -> (LcaTree, Vec<String>, usize) {
+        let tree = cousin_tree(); // B(0), C(1) → A(2) → root(3)
+        let root = tree.root();
+        let names = vec!["B".to_string(), "C".to_string(), "A".to_string(), "root".to_string()];
+        (tree, names, root)
+    }
+
+    const HEADER: &str = "query_name\tfrom_kmer\tto_kmer\tlabel_name\n";
+    const BODY: &str = "seq1\t0\t100\tB\n\
+                        seq1\t100\t200\troot\n\
+                        seq1\t200\t300\tC\n\
+                        seq2\t0\t50\tnone\n\
+                        seq2\t50\t150\tB\n";
+
+    fn smooth_to_string(input: &str, format: &OutputFormat) -> String {
+        let (tree, names, root) = names_fixture();
+        let mut out: Vec<u8> = Vec::new();
+        run_smooth(input.as_bytes(), &mut out, &tree, &names, root, 1000, 1, format);
+        String::from_utf8(out).unwrap()
+    }
+
+    /// Headerless name input is smoothed as names, not misparsed as ids.
+    #[test]
+    fn headerless_name_input_defaults_to_names() {
+        let format = OutputFormat { print_header: false, ..Default::default() };
+        let with_header = smooth_to_string(&format!("{HEADER}{BODY}"), &format);
+        let without = smooth_to_string(BODY, &format);
+        assert_eq!(
+            without, with_header,
+            "dropping the header changed how the labels were interpreted"
+        );
+        assert!(without.contains('B'), "expected name tokens in the output, got: {without}");
+    }
+
+    /// The output of `lookup --no-header` feeds straight back into `smooth`.
+    #[test]
+    fn headerless_round_trip_is_lossless() {
+        let format = OutputFormat { print_header: false, ..Default::default() };
+        let once = smooth_to_string(BODY, &format);
+        let twice = smooth_to_string(&once, &format);
+        assert_eq!(once, twice, "smoothing an already-smoothed headerless file changed it");
+    }
+
+    /// Headerless numeric input is smoothed as ids when the caller says so.
+    #[test]
+    fn headerless_id_input_needs_the_flag() {
+        let format = OutputFormat { print_header: false, label_ids: true, ..Default::default() };
+        // Same shape as BODY but in internal ids: B=0, root=3, C=1, miss='-'.
+        let body = "seq1\t0\t100\t0\n\
+                    seq1\t100\t200\t3\n\
+                    seq1\t200\t300\t1\n\
+                    seq2\t0\t50\t-\n\
+                    seq2\t50\t150\t0\n";
+        let out = smooth_to_string(body, &format);
+        // seq1's interior root run sits between cousins B and C, so it is
+        // promoted to their LCA, A(2) -- written as the id, not the name.
+        assert!(out.contains("\t2\n"), "expected the promoted interior as an id, got: {out}");
+        assert!(!out.contains('A'), "ids mode must not emit names: {out}");
+    }
+
+    /// A header describes the file in hand, so it beats a contradictory flag.
+    #[test]
+    fn a_header_overrides_the_flag() {
+        let lying = OutputFormat { print_header: false, label_ids: true, ..Default::default() };
+        let honest = OutputFormat { print_header: false, ..Default::default() };
+        // Would panic parsing "B" as a usize if the flag had been believed.
+        assert_eq!(
+            smooth_to_string(&format!("{HEADER}{BODY}"), &lying),
+            smooth_to_string(&format!("{HEADER}{BODY}"), &honest),
+        );
+    }
+
+    /// The miss token round-trips through a headerless file under a custom label.
+    #[test]
+    fn headerless_input_honours_a_custom_miss_label() {
+        let format = OutputFormat {
+            miss_label: "novel".to_string(),
+            print_header: false,
+            label_ids: false,
+        };
+        // seq2's leading run is a miss and has no neighbour to be promoted
+        // towards, so it must survive as the same token it arrived as.
+        let body = "seq2\t0\t50\tnovel\nseq2\t50\t150\tB\n";
+        let out = smooth_to_string(body, &format);
+        assert!(out.contains("\tnovel\n"), "miss label did not round-trip: {out}");
+        assert!(!out.contains("none"), "leaked the default miss label: {out}");
     }
 }

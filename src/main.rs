@@ -215,6 +215,9 @@ pub enum Subcommands {
 
         #[arg(help = "Do not print the header line.", long = "no-header")]
         no_header: bool,
+
+        #[arg(help = "Read (and write) internal label id integers rather than label names. Only consulted for headerless input: a `lookup` output that kept its header already says which vocabulary it uses, and that wins. Set this when smoothing the output of `lookup --no-header --report-label-ids`.", long = "report-label-ids", help_heading = "Advanced")]
+        report_label_ids: bool,
     },
 
     #[command(arg_required_else_help = true, about = "Simple reference implementation for debugging this program.")]
@@ -239,7 +242,7 @@ pub struct LookupQueryArgs {
     #[arg(help = "Print query names instead of query rank integers.", long = "report-query-names")]
     report_query_names: bool,
 
-    #[arg(help = "Print lines for runs of k-mers not found in the index. The miss symbol is 'none' normally, or '-' when --report-label-ids is set.", long = "report-misses")]
+    #[arg(help = "Print lines for runs of k-mers not found in the index. The miss symbol is whatever --miss-label says (default 'none'), or '-' when --report-label-ids is set.", long = "report-misses")]
     report_misses: bool,
 
     #[arg(help = "Do not print the header line.", long = "no-header")]
@@ -449,7 +452,11 @@ fn run_lookup_with_args(index: &ShortKColorIndex, n_threads: usize, args: &Looku
     };
     let writer = OutputWriter::new(
         BufWriter::with_capacity(1 << 21, out), seq_names, color_names, args.report_misses,
-        OutputFormat { miss_label: args.miss_label.clone(), print_header: !args.no_header },
+        OutputFormat {
+            miss_label: args.miss_label.clone(),
+            print_header: !args.no_header,
+            label_ids: args.report_label_ids,
+        },
     );
 
     let algo = LookupAlgorithmImpl { index };
@@ -835,7 +842,7 @@ fn main() {
             }
         },
 
-        Subcommands::Smooth { hierarchy, input, output, max_gap, n_threads, miss_label, no_header } => {
+        Subcommands::Smooth { hierarchy, input, output, max_gap, n_threads, miss_label, no_header, report_label_ids } => {
             let (tree, names) = read_hierarchy_file(&hierarchy, &[]);
             let root_id = tree.root();
 
@@ -857,7 +864,7 @@ fn main() {
             // across query sequences. Output is byte-identical for any thread count.
             let stats = smooth::run_smooth(
                 input, output, &tree, &names, root_id, max_gap, n_threads,
-                &OutputFormat { miss_label, print_header: !no_header },
+                &OutputFormat { miss_label, print_header: !no_header, label_ids: report_label_ids },
             );
             log::info!(
                 "Reads processed: {}, Intervals in: {}, Smoothed: {}, Merged: {}, Intervals out: {}",
