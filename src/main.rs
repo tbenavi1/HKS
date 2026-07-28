@@ -127,8 +127,8 @@ pub enum Subcommands {
         #[arg(help = "Path to the base index file", short, long, required = true)]
         index: PathBuf,
 
-        #[arg(help = "Path to the feature set file. Defaults to the base index path with extension .hksf.", long = "feature-set-file")]
-        labeling_file: Option<PathBuf>,
+        #[arg(help = "Path to the feature set file. Defaults to the base index path with extension .hksf. Repeatable: pass --feature-set-file several times to query multiple feature sets against a single load of the (much larger) base index; supply one -o per feature-set/query pair, feature set by feature set.", long = "feature-set-file")]
+        labeling_file: Vec<PathBuf>,
 
         #[arg(help = "Query k-mer length. Must be less or equal to the value of s used in index construction. If not given, defaults to the same k as during index construction.", short, required = false, value_parser = clap::value_parser!(u64).range(1..=256))] // 256 is an upper limit of SBWT
         k: Option<u64>,
@@ -223,7 +223,7 @@ pub enum Subcommands {
 
 #[derive(Parser, Debug)]
 pub struct LookupQueryArgs {
-    #[arg(help = "A fasta/fastq query file. Repeatable: pass -q several times to run multiple query files against a single index load; pair each with a matching -o (in the same order).", short, long, required = true)]
+    #[arg(help = "A fasta/fastq query file. Repeatable: pass -q several times to run multiple query files against a single index load. Every query is run against every --feature-set-file; supply one -o per feature-set/query pair (see -o for the ordering).", short, long, required = true)]
     query: Vec<PathBuf>,
 
     #[arg(help = "Print query names instead of query rank integers.", long = "report-query-names")]
@@ -241,7 +241,7 @@ pub struct LookupQueryArgs {
     #[arg(help = "Report internal label id integers instead of label names. This might save a lot of space if the labels are long. Use --print-hierarchy to print the internal ids.", long = "report-label-ids", help_heading = "Advanced")]
     report_label_ids: bool,
 
-    #[arg(help = "Output file. Defaults to stdout (only valid with a single -q). Repeatable: pass one -o per -q, in the same order.", short, long)]
+    #[arg(help = "Output file. Defaults to stdout (only valid with a single -q and a single feature set). Repeatable: pass one -o per feature-set/query pair, ordered feature set by feature set and, within each, in -q order.", short, long)]
     output: Vec<PathBuf>,
 }
 
@@ -360,19 +360,52 @@ fn resolve_labeling_file(index_path: &PathBuf, labeling_file: Option<PathBuf>) -
     labeling_file.unwrap_or_else(|| index_path.with_extension("hksf"))
 }
 
-fn load_index(index_path: &PathBuf, labeling_file: Option<PathBuf>) -> FixedKColorIndex {
-    let labeling_path = resolve_labeling_file(index_path, labeling_file);
+/// The feature set files to query, defaulting to the base index's sibling
+/// `.hksf` when none were given.
+fn resolve_labeling_files(index_path: &PathBuf, labeling_files: Vec<PathBuf>) -> Vec<PathBuf> {
+    if labeling_files.is_empty() {
+        vec![resolve_labeling_file(index_path, None)]
+    } else {
+        labeling_files
+    }
+}
+
+fn load_base(index_path: &PathBuf) -> HksBase<LcsWrapper> {
     let mut base_input = BufReader::new(File::open(index_path)
         .unwrap_or_else(|e| panic!("Could not open index file {}: {e}", index_path.display())));
-    let mut fs_input = BufReader::new(File::open(&labeling_path)
-        .unwrap_or_else(|e| panic!("Could not open feature set file {}: {e}", labeling_path.display())));
+    HksBase::<LcsWrapper>::load(&mut base_input)
+}
 
-    let base = HksBase::<LcsWrapper>::load(&mut base_input);
-    let labeling = Labeling::<SimpleColorStorage>::load_from_file(&mut fs_input);
-    assert!(base.sbwt().n_sets() == labeling.color_assignments.len(), "Mismatched feature set file and base index");
-    let index = FixedKColorIndex::from_parts(base, labeling);
+fn load_labeling(labeling_path: &PathBuf) -> Labeling<SimpleColorStorage> {
+    let mut fs_input = BufReader::new(File::open(labeling_path)
+        .unwrap_or_else(|e| panic!("Could not open feature set file {}: {e}", labeling_path.display())));
+    Labeling::<SimpleColorStorage>::load_from_file(&mut fs_input)
+}
+
+/// Pair a base with a labeling, checking that they describe the same k-mer set.
+///
+/// Takes the base by shared handle so that querying several feature sets reads
+/// the (multi-gigabyte) base once and pairs it with each labeling in turn.
+fn combine_base_and_labeling(
+    base: Arc<HksBase<LcsWrapper>>,
+    labeling: Labeling<SimpleColorStorage>,
+    labeling_path: &Path,
+) -> FixedKColorIndex {
+    assert!(
+        base.sbwt().n_sets() == labeling.color_assignments.len(),
+        "Mismatched feature set file and base index: {}",
+        labeling_path.display()
+    );
+    let index = FixedKColorIndex::from_shared_base(base, labeling);
     log::info!("Loaded index with s = {}", index.k());
     index
+}
+
+fn load_index(index_path: &PathBuf, labeling_file: Option<PathBuf>) -> FixedKColorIndex {
+    let labeling_path = resolve_labeling_file(index_path, labeling_file);
+    let base = Arc::new(load_base(index_path));
+    let labeling = load_labeling(&labeling_path);
+    combine_base_and_labeling(base, labeling, &labeling_path)
 }
 
 struct DynamicFastXReaderWrapper {
@@ -418,26 +451,60 @@ fn run_queries<A: ColoredKmerLookupAlgorithm + Send + Sync, W: RunWriter>(n_thre
     parallel_queries::lookup_parallel(n_threads, reader, index, batch_size, k, writer);
 }
 
-fn run_lookup_with_args(index: &ShortKColorIndex, n_threads: usize, args: &LookupQueryArgs) -> Result<(), String> {
-    let k = index.query_k();
+/// Split `--output` into one slice per feature set, validating the arity.
+///
+/// A run is a grid of `n_feature_sets x queries`, and `--output` lists its
+/// cells feature set by feature set (and, within each, in `-q` order). Omitting
+/// `--output` writes to stdout and is therefore only meaningful for a grid of
+/// exactly one cell — several runs sharing stdout would interleave unlabelled
+/// output. Returns one entry per feature set: `Some(paths)` with one path per
+/// query, or `None` for the single stdout cell.
+fn plan_outputs<'a>(
+    n_feature_sets: usize,
+    queries: &[PathBuf],
+    outputs: &'a [PathBuf],
+) -> Result<Vec<Option<&'a [PathBuf]>>, String> {
+    let expected = n_feature_sets * queries.len();
 
-    // Output arity: either omit --output entirely (single query -> stdout), or supply
-    // exactly one --output per --query, paired positionally. Writing several queries to a
-    // shared stdout would interleave unlabelled runs, so it is rejected.
-    if !args.output.is_empty() && args.output.len() != args.query.len() {
+    if outputs.is_empty() {
+        if expected > 1 {
+            return Err(format!(
+                "{} feature set(s) x {} query file(s) = {} output(s) needed, but no -o was given; \
+                 stdout can only carry a single run. Pass one -o per feature-set/query pair.",
+                n_feature_sets,
+                queries.len(),
+                expected
+            ));
+        }
+        return Ok(vec![None]);
+    }
+
+    if outputs.len() != expected {
         return Err(format!(
-            "Got {} --query file(s) but {} --output path(s); pass one -o per -q (in the same order), \
-             or omit -o entirely to write a single query to stdout.",
-            args.query.len(),
-            args.output.len()
+            "Got {} feature set(s) x {} query file(s) = {} output(s) needed, but {} -o path(s) were given. \
+             Pass one -o per feature-set/query pair, ordered feature set by feature set and, within each, \
+             in -q order; or omit -o entirely to write a single run to stdout.",
+            n_feature_sets,
+            queries.len(),
+            expected,
+            outputs.len()
         ));
     }
-    if args.output.is_empty() && args.query.len() > 1 {
-        return Err(
-            "Multiple -q query files require one -o per query; stdout can only carry a single query."
-                .to_string(),
-        );
-    }
+
+    Ok(outputs.chunks(queries.len()).map(Some).collect())
+}
+
+/// Run every `-q` query against one already-loaded feature set.
+///
+/// `outputs` is this feature set's row of the output grid (see [`plan_outputs`]):
+/// one path per query, or `None` to write a single query to stdout.
+fn run_lookup_with_args(
+    index: &ShortKColorIndex,
+    n_threads: usize,
+    args: &LookupQueryArgs,
+    outputs: Option<&[PathBuf]>,
+) -> Result<(), String> {
+    let k = index.query_k();
 
     // Label names are shared across queries; compute once, clone per output writer.
     let color_names: Option<Vec<String>> = if args.report_label_ids {
@@ -452,7 +519,7 @@ fn run_lookup_with_args(index: &ShortKColorIndex, n_threads: usize, args: &Looku
         let reader = open_fastx(query_path)?;
 
         // A dynamic writer is fine performance-wise because it's wrapped in a buffered writer.
-        let out: Box<dyn Write + Send> = if let Some(path) = args.output.get(i) {
+        let out: Box<dyn Write + Send> = if let Some(path) = outputs.and_then(|paths| paths.get(i)) {
             Box::new(File::create(path).map_err(|e| format!("Could not create output file {}: {e}", path.display()))?)
         } else {
             Box::new(std::io::stdout())
@@ -490,7 +557,16 @@ fn run_prompt_loop(index: &ShortKColorIndex, n_threads: usize) {
         if matches!(trimmed, "quit" | "exit" | "q") { break; }
         let tokens = std::iter::once("prompt").chain(trimmed.split_whitespace());
         match LookupQueryArgs::try_parse_from(tokens) {
-            Ok(args) => if let Err(e) = run_lookup_with_args(index, n_threads, &args) { eprintln!("Error: {e}"); },
+            // The prompt holds one already-loaded feature set, so its grid is
+            // a single row.
+            Ok(args) => match plan_outputs(1, &args.query, &args.output) {
+                Ok(plan) => {
+                    if let Err(e) = run_lookup_with_args(index, n_threads, &args, plan[0]) {
+                        eprintln!("Error: {e}");
+                    }
+                }
+                Err(e) => eprintln!("Error: {e}"),
+            },
             Err(e) => eprintln!("{e}"),
         }
     }
@@ -775,20 +851,43 @@ fn main() {
 
 
         Subcommands::Lookup { index: index_path, labeling_file, k, n_threads, query_args } => {
-            log::info!("Loading the index ...");
-            let index_loading_start = std::time::Instant::now();
-            let index = load_index(&index_path, labeling_file);
-            log::info!("Index loaded in {} seconds", index_loading_start.elapsed().as_secs_f64());
-
-            let k = k.unwrap_or(index.k() as u64) as usize;
-            if k > index.k() {
-                panic!("Error: query k = {} larger than indexing s = {}", k, index.k());
-            }
-
+            let labeling_paths = resolve_labeling_files(&index_path, labeling_file);
+            let output_plan = plan_outputs(labeling_paths.len(), &query_args.query, &query_args.output)
+                .unwrap_or_else(|e| panic!("{e}"));
             let n_threads = n_threads as usize;
-            // Constructor does extra preprocessing if k < index.k()
-            let index = ShortKColorIndex::new(index, k, n_threads);
-            run_lookup_with_args(&index, n_threads, &query_args).unwrap_or_else(|e| panic!("{e}"));
+
+            // The base index dwarfs a feature set (gigabytes of SBWT against
+            // hundreds of megabytes of labeling) and is the same for all of
+            // them, so it is read once and shared; each subsequent feature set
+            // costs only its own labeling.
+            let mut shared_base: Option<Arc<HksBase<LcsWrapper>>> = None;
+
+            for (labeling_path, outputs) in labeling_paths.iter().zip(output_plan) {
+                let load_start = std::time::Instant::now();
+                let base = match &shared_base {
+                    Some(base) => Arc::clone(base),
+                    None => {
+                        log::info!("Loading the base index ...");
+                        let base = Arc::new(load_base(&index_path));
+                        shared_base = Some(Arc::clone(&base));
+                        base
+                    }
+                };
+                log::info!("Loading feature set {} ...", labeling_path.display());
+                let index = combine_base_and_labeling(base, load_labeling(labeling_path), labeling_path);
+                log::info!("Index loaded in {} seconds", load_start.elapsed().as_secs_f64());
+
+                let k = k.unwrap_or(index.k() as u64) as usize;
+                if k > index.k() {
+                    panic!("Error: query k = {} larger than indexing s = {}", k, index.k());
+                }
+
+                // Constructor does extra preprocessing if k < index.k(). It
+                // rewrites the labeling only, so the shared base is untouched.
+                let index = ShortKColorIndex::new(index, k, n_threads);
+                run_lookup_with_args(&index, n_threads, &query_args, outputs)
+                    .unwrap_or_else(|e| panic!("{e}"));
+            }
         },
 
         Subcommands::Prompt { index: index_path, labeling_file, k, n_threads } => {
@@ -888,5 +987,57 @@ fn main() {
 
             single_threaded_queries::lookup_single_threaded(&query_path, &index, index.k());
         }
+    }
+}
+
+#[cfg(test)]
+mod output_plan_tests {
+    use super::plan_outputs;
+    use std::path::PathBuf;
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn single_feature_set_single_query_defaults_to_stdout() {
+        let plan = plan_outputs(1, &paths(&["q.fa"]), &[]).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert!(plan[0].is_none());
+    }
+
+    #[test]
+    fn stdout_is_rejected_for_more_than_one_run() {
+        // Two feature sets sharing stdout would interleave unlabelled output.
+        assert!(plan_outputs(2, &paths(&["q.fa"]), &[]).is_err());
+        assert!(plan_outputs(1, &paths(&["a.fa", "b.fa"]), &[]).is_err());
+    }
+
+    #[test]
+    fn outputs_are_split_feature_set_major() {
+        let queries = paths(&["a.fa", "b.fa"]);
+        let outs = paths(&["fs1.a", "fs1.b", "fs2.a", "fs2.b"]);
+        let plan = plan_outputs(2, &queries, &outs).unwrap();
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].unwrap(), &outs[0..2]);
+        assert_eq!(plan[1].unwrap(), &outs[2..4]);
+    }
+
+    #[test]
+    fn wrong_output_count_is_rejected() {
+        let queries = paths(&["a.fa", "b.fa"]);
+        // 2 feature sets x 2 queries needs 4, not 2 or 5.
+        assert!(plan_outputs(2, &queries, &paths(&["x", "y"])).is_err());
+        assert!(plan_outputs(2, &queries, &paths(&["x", "y", "z", "w", "v"])).is_err());
+        assert!(plan_outputs(2, &queries, &paths(&["x", "y", "z", "w"])).is_ok());
+    }
+
+    #[test]
+    fn single_feature_set_keeps_the_pre_existing_one_o_per_q_contract() {
+        let queries = paths(&["a.fa", "b.fa", "c.fa"]);
+        let outs = paths(&["a.tsv", "b.tsv", "c.tsv"]);
+        let plan = plan_outputs(1, &queries, &outs).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].unwrap(), outs.as_slice());
     }
 }

@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::ops::Range;
+use std::sync::Arc;
 
 use bitvec::prelude::*;
 use bitvec_sds::traits::RandomAccessU32;
@@ -16,9 +17,19 @@ const LABELING_FILE_MAGIC: [u8; 8] = *b"hksfs0.1";
 const LABELING_FILE_VERSION: u32 = 2;
 
 
+/// A base index paired with one feature set's labeling.
+///
+/// The base is held behind an `Arc` because it is by far the largest part of an
+/// index (gigabytes: the SBWT plus the LCS array) and is **identical for every
+/// feature set built over the same k-mer set**. Sharing it lets a caller read it
+/// from disk once and then pair it with each labeling in turn — see
+/// [`HksIndex::from_shared_base`] and [`HksIndex::shared_base`] — instead of
+/// re-reading those gigabytes per feature set. Nothing mutates the base after
+/// construction, so a shared immutable handle is all that is needed; the `Arc`
+/// is dereferenced on access and never atomically touched on the query path.
 #[derive(Debug, Clone)]
 pub struct HksIndex<L: ContractLeft + Clone + MySerialize + From<LcsArray>, C: ColorStorage + Clone + MySerialize + From<SimpleColorStorage>> {
-    base: HksBase<L>,
+    base: Arc<HksBase<L>>,
     labeling: Labeling<C>,
 }
 
@@ -81,14 +92,35 @@ impl<L: ContractLeft + Clone + MySerialize + From<LcsArray> + LcsAccess, C: Colo
         &self.labeling
     }
 
+    /// Decompose into owned parts.
+    ///
+    /// If the base is shared with another `HksIndex` (see
+    /// [`Self::from_shared_base`]) it cannot be moved out and is cloned, which
+    /// copies the whole SBWT. Callers on a hot path should prefer [`Self::base`]
+    /// or [`Self::shared_base`].
     pub fn into_parts(self) -> (SbwtIndex<SubsetMatrix>, L, Labeling<C>) {
-        (self.base.sbwt, self.base.lcs, self.labeling)
+        let base = Arc::try_unwrap(self.base).unwrap_or_else(|shared| (*shared).clone());
+        (base.sbwt, base.lcs, self.labeling)
     }
 
     /// Build a new index from already-converted parts. Use after `new_with_labeling`
     /// during construction, or after `load_base` + `FeatureSet::load_from_file` during loading.
     pub fn from_parts(base: HksBase<L>, labeling: Labeling<C>) -> Self {
-        HksIndex::<L, C> { base , labeling }
+        Self::from_shared_base(Arc::new(base), labeling)
+    }
+
+    /// Pair an already-loaded base with a labeling, without copying the base.
+    ///
+    /// This is what makes querying several feature sets cost one base load
+    /// rather than one per feature set: load the base once, then call this for
+    /// each labeling, obtaining the handle from [`Self::shared_base`].
+    pub fn from_shared_base(base: Arc<HksBase<L>>, labeling: Labeling<C>) -> Self {
+        HksIndex::<L, C> { base, labeling }
+    }
+
+    /// A new handle to this index's base, for pairing with another labeling.
+    pub fn shared_base(&self) -> Arc<HksBase<L>> {
+        Arc::clone(&self.base)
     }
 
     pub fn rename_labels(&mut self, new_names: Vec<String>) {
@@ -192,15 +224,21 @@ impl<L: ContractLeft + Clone + MySerialize + From<LcsArray> + LcsAccess, C: Colo
         let lcs_index = L::from(raw_lcs);
         let base = HksBase{ sbwt, lcs: lcs_index };
         log::info!("Color structure construction complete");
-        HksIndex::<L, C> { base, labeling }
+        HksIndex::<L, C> { base: Arc::new(base), labeling }
     }
 
     pub fn n_sbwt_sets(&self) -> usize {
         self.base.sbwt.n_sets()
     }
 
+    /// Panics if the base is shared: this mutates it, and every other holder
+    /// would silently see the change. Call it before handing the base to a
+    /// second labeling (in practice it is only used on a freshly loaded index).
     pub fn build_sbwt_select(&mut self) {
-        self.base.sbwt.build_select();
+        Arc::get_mut(&mut self.base)
+            .expect("build_sbwt_select requires exclusive ownership of the base index")
+            .sbwt
+            .build_select();
     }
 
     // S is the s-mer length, s <= k
