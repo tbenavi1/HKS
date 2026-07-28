@@ -383,12 +383,40 @@ fn load_index(index_path: &PathBuf, labeling_file: Option<PathBuf>) -> FixedKCol
     let mut fs_input = BufReader::new(File::open(&labeling_path)
         .unwrap_or_else(|e| panic!("Could not open feature set file {}: {e}", labeling_path.display())));
 
+    // Timed separately, and reported against each file's size. The two differ
+    // by an order of magnitude in bytes and are read from different files, so
+    // one combined "index loaded" figure cannot be sanity-checked against
+    // anything -- and a throughput that is impossible for the hardware is the
+    // clearest signal that a measurement is being distorted by something else
+    // on the node.
+    let base_start = std::time::Instant::now();
     let base = HksBase::<LcsWrapper>::load(&mut base_input);
+    log_load("base index", index_path, base_start.elapsed());
+
+    let labeling_start = std::time::Instant::now();
     let labeling = Labeling::<SimpleColorStorage>::load_from_file(&mut fs_input);
+    log_load("labeling", &labeling_path, labeling_start.elapsed());
+
     assert!(base.sbwt().n_sets() == labeling.color_assignments.len(), "Mismatched feature set file and base index");
     let index = FixedKColorIndex::from_parts(base, labeling);
     log::info!("Loaded index with s = {}", index.k());
     index
+}
+
+/// Report how long one file took to load, and how fast that was.
+fn log_load(what: &str, path: &PathBuf, elapsed: std::time::Duration) {
+    let secs = elapsed.as_secs_f64();
+    match std::fs::metadata(path).map(|m| m.len()) {
+        Ok(bytes) => {
+            let gib = bytes as f64 / (1 << 30) as f64;
+            log::info!(
+                "Loaded {what} from {} ({gib:.2} GiB) in {secs:.2} s ({:.2} GiB/s)",
+                path.display(),
+                if secs > 0.0 { gib / secs } else { f64::INFINITY },
+            );
+        }
+        Err(_) => log::info!("Loaded {what} from {} in {secs:.2} s", path.display()),
+    }
 }
 
 struct DynamicFastXReaderWrapper {
@@ -462,7 +490,13 @@ fn run_lookup_with_args(index: &ShortKColorIndex, n_threads: usize, args: &Looku
     let algo = LookupAlgorithmImpl { index };
 
     log::info!("Running queries from {} ...", args.query.display());
+    let query_start = std::time::Instant::now();
     run_queries(n_threads, reader, &algo, args.batch_size as usize, k, writer);
+    // Separated from the index load above so a caller can tell which of the
+    // two a change moved. They scale with completely different things -- the
+    // index with its size on disk, this with the query -- and a single
+    // wall-clock number for the subcommand hides that.
+    log::info!("Queries finished in {:.2} s ({n_threads} threads)", query_start.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -862,6 +896,7 @@ fn main() {
             // Single streaming entry point for every thread count. n_threads == 1
             // is the low-memory single-threaded path; > 1 parallelizes smoothing
             // across query sequences. Output is byte-identical for any thread count.
+            let smooth_start = std::time::Instant::now();
             let stats = smooth::run_smooth(
                 input, output, &tree, &names, root_id, max_gap, n_threads,
                 &OutputFormat { miss_label, print_header: !no_header, label_ids: report_label_ids },
@@ -870,6 +905,14 @@ fn main() {
                 "Reads processed: {}, Intervals in: {}, Smoothed: {}, Merged: {}, Intervals out: {}",
                 stats.reads_processed, stats.intervals_in, stats.intervals_smoothed,
                 stats.intervals_merged, stats.intervals_out,
+            );
+            // Intervals per second is the figure that stays comparable across
+            // inputs; wall clock alone says nothing about whether a change
+            // helped when the two runs smoothed different amounts of data.
+            let secs = smooth_start.elapsed().as_secs_f64();
+            log::info!(
+                "Smoothing finished in {secs:.2} s ({n_threads} threads, {:.1} M intervals/s in)",
+                if secs > 0.0 { stats.intervals_in as f64 / secs / 1e6 } else { f64::INFINITY },
             );
         },
 
