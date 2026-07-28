@@ -19,21 +19,29 @@ impl<T: RunWriter + ?Sized> RunWriter for &mut T {
 /// reporting label *names*. Numeric-id mode always writes `-` instead.
 pub const DEFAULT_MISS_LABEL: &str = "none";
 
-/// Output-format settings that `lookup` and `smooth` have to agree on.
+/// The wire format `lookup` writes and `smooth` reads.
 ///
-/// They are grouped because they travel together and because `smooth` *parses*
-/// the same miss token it writes: pointing it at a `lookup` output produced
-/// with a different token would silently reinterpret every miss run as an
-/// unknown feature name. One type, one default, both subcommands.
+/// These travel together because `smooth` *parses* what `lookup` wrote as well
+/// as writing it back out: point it at an output produced with a different miss
+/// token and every miss run is silently reinterpreted as an unknown feature
+/// name. One type, one default, both subcommands.
+///
+/// `label_ids` says which of the two label vocabularies the fourth column uses.
+/// `lookup` derives it from `--report-label-ids`, the same flag that decides
+/// whether it has a name table to write at all, so there is a single source of
+/// truth. `smooth` needs it because it resolves those tokens against the
+/// hierarchy — though when the input carries a header, the header wins, since
+/// it describes the file actually in hand.
 #[derive(Clone, Debug)]
 pub struct OutputFormat {
     pub miss_label: String,
     pub print_header: bool,
+    pub label_ids: bool,
 }
 
 impl Default for OutputFormat {
     fn default() -> Self {
-        Self { miss_label: DEFAULT_MISS_LABEL.to_string(), print_header: true }
+        Self { miss_label: DEFAULT_MISS_LABEL.to_string(), print_header: true, label_ids: false }
     }
 }
 
