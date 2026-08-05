@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::io::{BufWriter, Read, Write};
 
 use crate::lca_tree::LcaTree;
+use crate::parallel_queries::OutputFormat;
 
 // ---------------------------------------------------------------------------
 // Interval representation
@@ -27,11 +28,11 @@ pub struct Interval {
 
 /// Reusable working buffers for [`smooth_intervals`].
 ///
-/// The window scan allocates per *window*, and a whole-chromosome query group
-/// contains millions of windows, so allocating these fresh each time dominates
-/// allocator traffic in a parallel run. Hoisting them here lets one buffer set
-/// serve every window of every group a worker handles: they are cleared, not
-/// reallocated, once they reach steady-state capacity.
+/// The window scan below allocates per *window*, and a whole-chromosome query
+/// group contains millions of windows, so allocating these fresh each time is
+/// the dominant source of allocator traffic in a parallel run. Hoisting them
+/// here lets one buffer set serve every window of every group a worker handles;
+/// they are cleared, never reallocated, once they reach steady-state capacity.
 #[derive(Default)]
 pub struct SmoothScratch {
     was_related: Vec<bool>,
@@ -42,8 +43,8 @@ pub struct SmoothScratch {
 /// Smooth a single query's intervals in-place using the hierarchy.
 /// Returns the number of feature reassignments made.
 ///
-/// Allocates its own scratch. Use [`smooth_intervals_with`] when smoothing many
-/// queries so the buffers are reused across them.
+/// Allocates its own scratch. Call [`smooth_intervals_with`] in a loop over many
+/// queries so the buffers are reused instead.
 pub fn smooth_intervals(intervals: &mut Vec<Interval>, tree: &LcaTree, max_gap: u64) -> u64 {
     smooth_intervals_with(intervals, tree, max_gap, &mut SmoothScratch::default())
 }
@@ -58,7 +59,7 @@ pub fn smooth_intervals_with(
     if intervals.len() < 2 {
         return 0;
     }
-    // Split the borrow up front so all three buffers can be held at once.
+    // Split the borrow up front so the three buffers can be held simultaneously.
     let SmoothScratch { was_related, related, disallowed } = scratch;
     let mut total_reassignments = 0u64;
     let n = intervals.len();
@@ -216,13 +217,18 @@ pub fn smooth_intervals_with(
 // ---------------------------------------------------------------------------
 
 /// Merges adjacent intervals that have the same feature and are contiguous.
-/// Returns (merged intervals, number of intervals eliminated).
+/// Rewrites `intervals` in place; returns the number of intervals eliminated.
+///
+/// In place because this runs on every worker thread once per query group. The
+/// previous version allocated a second `Vec` the size of the input each time,
+/// and simultaneous large allocations from many threads are what make a
+/// multithreaded smoother contend in the allocator instead of doing work.
 pub fn merge_intervals(intervals: &mut Vec<Interval>) -> u64 {
     let n_in = intervals.len();
     // `dedup_by` passes (next, current) and drops `next` when the closure is
-    // true, so extending `current` there is exactly the merge. Done in place:
-    // this runs on every worker for every group, and the old version allocated a
-    // second Vec the size of the input each time.
+    // true, so extending `current` in that branch is exactly the merge. When a
+    // run of several intervals merges, `current` stays the retained one and is
+    // extended each time.
     intervals.dedup_by(|next, current| {
         if next.feature == current.feature
             && next.start == current.end
@@ -257,9 +263,10 @@ fn resolve_feature(
     name_to_id: &std::collections::HashMap<String, usize>,
     root_id: usize,
     uses_names: bool,
+    miss_label: &str,
 ) -> (usize, bool) {
     if uses_names {
-        if token == "none" {
+        if token == miss_label {
             (root_id, true)
         } else {
             let id = name_to_id.get(token)
@@ -283,7 +290,8 @@ fn resolve_feature(
 /// Writes bytes straight into `out` rather than returning an owned `String`.
 /// This is called once per *output interval*, so returning a `String` meant one
 /// short-lived heap allocation per output line — tens of millions per run, from
-/// every worker at once.
+/// every worker thread at once. That allocation traffic, not the smoothing
+/// itself, is what made `smooth` scale badly with thread count.
 fn write_feature(
     out: &mut Vec<u8>,
     feature: usize,
@@ -291,10 +299,12 @@ fn write_feature(
     names: &[String],
     root_id: usize,
     uses_names: bool,
+    miss_label: &str,
 ) {
     if originally_none && feature == root_id {
-        // Was none and smoothing didn't resolve it → keep as none
-        out.extend_from_slice(if uses_names { b"none".as_slice() } else { b"-".as_slice() });
+        // Was a miss and smoothing didn't resolve it → keep it a miss. The same
+        // token is used on input and output, so a round trip is lossless.
+        out.extend_from_slice(if uses_names { miss_label.as_bytes() } else { b"-" });
     } else if uses_names {
         out.extend_from_slice(names[feature].as_bytes());
     } else {
@@ -322,6 +332,11 @@ impl SmoothStats {
 /// formatting tens of millions of lines dominate the wall time, so both must
 /// run on the worker thread. Parsing borrows byte subslices of the input —
 /// no per-line `String` allocation, unlike `reader.lines()`.
+///
+/// `intervals`, `smooth_scratch` and `out` are all caller-owned buffers, cleared
+/// here rather than allocated. They are recycled across every group the run processes, so after
+/// the first batch this function performs no heap allocation at all — which is
+/// the property that lets it scale without a thread-caching allocator.
 fn smooth_group(
     slice: &[u8],
     cfg: &SmoothCfg,
@@ -359,7 +374,7 @@ fn smooth_group(
         let feat_token = std::str::from_utf8(feat_b).expect("non-UTF8 feature name");
 
         let (feature, originally_none) =
-            resolve_feature(feat_token, cfg.name_to_id, cfg.root_id, uses_names);
+            resolve_feature(feat_token, cfg.name_to_id, cfg.root_id, uses_names, cfg.miss_label);
         intervals.push(Interval { start, end, feature, originally_none });
     }
 
@@ -368,15 +383,19 @@ fn smooth_group(
     let eliminated = merge_intervals(intervals);
     let n_out = intervals.len() as u64;
 
-    // `out` is a recycled buffer that has already grown to whatever this
-    // workload needs, so it is neither allocated nor sized here. Sizing per
-    // group is a trap in both directions: reserving the input size mmaps
-    // hundreds of MB per worker for a group that collapses to a few intervals,
-    // while a fixed reserve is huge overhead for read data, where a group's
-    // output is a few dozen bytes and there are millions of them.
+    // No reserve and no fresh allocation: `out` is a recycled buffer that has
+    // already grown to whatever this workload needs. Sizing it per group is a
+    // trap in both directions — reserving the input size mmaps hundreds of MB
+    // per worker for a group that collapses to a few intervals, while a fixed
+    // reserve is enormous overhead for read data, where a group's output is a
+    // few dozen bytes and there are millions of them. Recycling sidesteps the
+    // choice: each buffer converges on its own workload's size.
     for iv in intervals.iter() {
         write!(out, "{}\t{}\t{}\t", query_id, iv.start, iv.end).expect("formatting error");
-        write_feature(out, iv.feature, iv.originally_none, cfg.names, cfg.root_id, uses_names);
+        write_feature(
+            out, iv.feature, iv.originally_none, cfg.names, cfg.root_id, uses_names,
+            cfg.miss_label,
+        );
         out.push(b'\n');
     }
 
@@ -401,6 +420,9 @@ struct SmoothCfg<'a> {
     name_to_id: &'a std::collections::HashMap<String, usize>,
     root_id: usize,
     max_gap: u64,
+    /// Token meaning "not in the index", both parsed from the input and written
+    /// back out, so a round trip through `smooth` is lossless.
+    miss_label: &'a str,
     max_groups: usize, // dispatch a batch once this many groups have closed …
     max_bytes: usize,  // … or once the closed groups reach this many bytes.
 }
@@ -471,30 +493,30 @@ impl Grouper {
     }
 }
 
+/// Smooth one batch of closed groups in parallel and write the output.
+///
+/// Worker buffers are collected and emitted in input order. Because batches are
+/// processed strictly in sequence, the output is globally order-preserving and
+/// byte-identical regardless of `n_threads`.
 thread_local! {
     /// Per-worker parse and smoothing buffers, one set per pool thread for the
     /// whole run.
     ///
     /// Deliberately not `map_init`: rayon builds that closure's value once per
     /// *leaf of the split tree*, not once per thread, and the leaf count climbs
-    /// steeply with thread count -- measured at 4 leaves for 1 thread but 3190
-    /// for 16 on one short-read input. Each fresh set then has to re-grow its
-    /// buffers, which for query groups small enough that a leaf covers only a
-    /// couple of dozen of them costs more than the reuse saves. Keying off the
-    /// thread bounds the number of buffer sets by the pool size.
+    /// steeply with thread count -- measured at 4 leaves for t1 but 3190 for t16
+    /// on one short-read input. Each fresh set then has to re-grow its buffers,
+    /// which for query groups small enough that a leaf covers only a couple of
+    /// dozen of them costs more than the reuse saves. Keying off the thread
+    /// instead bounds the number of buffer sets by the pool size.
     static WORKER_BUFS: std::cell::RefCell<(Vec<Interval>, SmoothScratch)> =
         std::cell::RefCell::new((Vec::new(), SmoothScratch::default()));
 }
 
-/// Smooth one batch of closed groups in parallel and write the output.
-///
-/// `outbufs` is the run's recycled output-buffer pool, owned by `run_smooth` so
-/// it survives across batches; it grows only to the largest group count any one
-/// batch needs, and each buffer keeps the capacity it reached.
-///
-/// Worker buffers are collected and emitted in input order. Because batches are
-/// processed strictly in sequence, the output is globally order-preserving and
-/// byte-identical regardless of `n_threads`.
+/// `outbufs` is the run's recycled output-buffer pool, owned by `run_smooth` and
+/// passed in so it survives across batches. It only ever grows, to the largest
+/// group count any single batch has needed; every buffer in it keeps the
+/// capacity it reached, so steady state allocates nothing.
 fn dispatch_batch<W: Write>(
     pool: &rayon::ThreadPool,
     bytes: &[u8],
@@ -512,10 +534,11 @@ fn dispatch_batch<W: Write>(
     if outbufs.len() < ranges.len() {
         outbufs.resize_with(ranges.len(), Vec::new);
     }
-    // One output buffer per group, taken from the run's pool rather than
-    // allocated. `Zip` is an indexed parallel iterator, so results still come
-    // back in input order and the output stays byte-identical at any thread
-    // count.
+    // One output buffer per group, taken from the pool rather than allocated,
+    // and `map_init` gives each worker an interval buffer it reuses across the
+    // groups it handles. `Zip` and `MapInit` are both indexed parallel
+    // iterators, so results still come back in input order and the output stays
+    // byte-identical at any thread count.
     let results: Vec<SmoothStats> = pool.install(|| {
         ranges
             .par_iter()
@@ -565,6 +588,9 @@ fn dispatch_batch<W: Write>(
 /// clamped to at least 1. `n_threads == 1` is the low-memory single-threaded
 /// streaming path — there is deliberately no separate single-threaded function
 /// to keep in sync, only this one entry point.
+/// `format` must match whatever produced the input: the miss token is parsed as
+/// well as written, so a mismatch would reinterpret every miss run as an unknown
+/// feature name.
 pub fn run_smooth(
     input: impl Read,
     output: impl Write,
@@ -573,7 +599,10 @@ pub fn run_smooth(
     root_id: usize,
     max_gap: u64,
     n_threads: usize,
+    format: &OutputFormat,
 ) -> SmoothStats {
+    let miss_label = format.miss_label.as_str();
+    let print_header = format.print_header;
     let n_threads = n_threads.max(1);
     // Read granularity and batch-dispatch thresholds. A batch closes at whichever
     // limit trips first, keeping peak memory near max_bytes + largest-single-group
@@ -602,6 +631,7 @@ pub fn run_smooth(
         name_to_id: &name_to_id,
         root_id,
         max_gap,
+        miss_label,
         max_groups: BATCH_MAX_GROUPS,
         max_bytes: BATCH_MAX_BYTES,
     };
@@ -617,7 +647,9 @@ pub fn run_smooth(
     let mut grouper = Grouper::default();
     // Recycled across every batch; see dispatch_batch.
     let mut outbufs: Vec<Vec<u8>> = Vec::new();
-    let mut uses_names = false;
+    // What the caller says the input is. A header, if there is one, overrides
+    // this below -- the file describes itself better than a flag can.
+    let mut uses_names = !format.label_ids;
     let mut first_content = true;
 
     // Process one raw line (may span block boundaries): trim, drop blanks,
@@ -637,9 +669,24 @@ pub fn run_smooth(
         if *first_content {
             *first_content = false;
             if line.starts_with(b"query_rank") || line.starts_with(b"query_name") {
-                *uses_names = line.windows(b"label_name".len()).any(|w| w == b"label_name");
-                writer.write_all(line).expect("write error");
-                writer.write_all(b"\n").expect("write error");
+                // The header is always consumed, and it settles whether the
+                // input uses names or numeric ids -- it describes the file in
+                // hand, so it beats whatever --report-label-ids claimed. It is
+                // only echoed when the caller wants a header of their own.
+                let header_says_names = line.windows(b"label_name".len()).any(|w| w == b"label_name");
+                if header_says_names != *uses_names {
+                    log::warn!(
+                        "input header says the fourth column holds label {}, not label {} as \
+                         --report-label-ids implies; trusting the header",
+                        if header_says_names { "names" } else { "ids" },
+                        if header_says_names { "ids" } else { "names" },
+                    );
+                }
+                *uses_names = header_says_names;
+                if print_header {
+                    writer.write_all(line).expect("write error");
+                    writer.write_all(b"\n").expect("write error");
+                }
                 return;
             }
             // Not a header — fall through and treat this line as data.
@@ -771,12 +818,12 @@ mod tests {
                      seq3\t0\t100\tA\n";
 
         let mut out_seq: Vec<u8> = Vec::new();
-        let s1 = run_smooth(input.as_bytes(), &mut out_seq, &tree, &names, root, 1000, 1);
+        let s1 = run_smooth(input.as_bytes(), &mut out_seq, &tree, &names, root, 1000, 1, &OutputFormat::default());
 
         for nt in [1usize, 2, 4] {
             let mut out_par: Vec<u8> = Vec::new();
             let s2 =
-                run_smooth(input.as_bytes(), &mut out_par, &tree, &names, root, 1000, nt);
+                run_smooth(input.as_bytes(), &mut out_par, &tree, &names, root, 1000, nt, &OutputFormat::default());
             assert_eq!(out_seq, out_par, "parallel output differs at n_threads={nt}");
             assert_eq!(s1.reads_processed, s2.reads_processed);
             assert_eq!(s1.intervals_in, s2.intervals_in);
@@ -808,14 +855,109 @@ mod tests {
         }
 
         let mut out_seq: Vec<u8> = Vec::new();
-        let s1 = run_smooth(input.as_bytes(), &mut out_seq, &tree, &names, root, 1000, 1);
+        let s1 = run_smooth(input.as_bytes(), &mut out_seq, &tree, &names, root, 1000, 1, &OutputFormat::default());
 
         let mut out_ord: Vec<u8> = Vec::new();
         let s2 =
-            run_smooth(input.as_bytes(), &mut out_ord, &tree, &names, root, 1000, 4);
+            run_smooth(input.as_bytes(), &mut out_ord, &tree, &names, root, 1000, 4, &OutputFormat::default());
         assert_eq!(out_seq, out_ord, "ordered streaming output differs across batches");
         assert_eq!(s1.reads_processed, s2.reads_processed);
         assert_eq!(s1.reads_processed, 140000);
         assert_eq!(s1.intervals_smoothed, s2.intervals_smoothed);
+    }
+
+    // --- headerless input ------------------------------------------------
+    //
+    // The header is what told `smooth` whether column four holds names or
+    // numeric ids. Once `lookup --no-header` became useful -- its output is
+    // then already in the shape a downstream tool wants, with no rewriting
+    // pass -- that signal is gone and `--report-label-ids` has to supply it.
+
+    fn names_fixture() -> (LcaTree, Vec<String>, usize) {
+        let tree = cousin_tree(); // B(0), C(1) → A(2) → root(3)
+        let root = tree.root();
+        let names = vec!["B".to_string(), "C".to_string(), "A".to_string(), "root".to_string()];
+        (tree, names, root)
+    }
+
+    const HEADER: &str = "query_name\tfrom_kmer\tto_kmer\tlabel_name\n";
+    const BODY: &str = "seq1\t0\t100\tB\n\
+                        seq1\t100\t200\troot\n\
+                        seq1\t200\t300\tC\n\
+                        seq2\t0\t50\tnone\n\
+                        seq2\t50\t150\tB\n";
+
+    fn smooth_to_string(input: &str, format: &OutputFormat) -> String {
+        let (tree, names, root) = names_fixture();
+        let mut out: Vec<u8> = Vec::new();
+        run_smooth(input.as_bytes(), &mut out, &tree, &names, root, 1000, 1, format);
+        String::from_utf8(out).unwrap()
+    }
+
+    /// Headerless name input is smoothed as names, not misparsed as ids.
+    #[test]
+    fn headerless_name_input_defaults_to_names() {
+        let format = OutputFormat { print_header: false, ..Default::default() };
+        let with_header = smooth_to_string(&format!("{HEADER}{BODY}"), &format);
+        let without = smooth_to_string(BODY, &format);
+        assert_eq!(
+            without, with_header,
+            "dropping the header changed how the labels were interpreted"
+        );
+        assert!(without.contains('B'), "expected name tokens in the output, got: {without}");
+    }
+
+    /// The output of `lookup --no-header` feeds straight back into `smooth`.
+    #[test]
+    fn headerless_round_trip_is_lossless() {
+        let format = OutputFormat { print_header: false, ..Default::default() };
+        let once = smooth_to_string(BODY, &format);
+        let twice = smooth_to_string(&once, &format);
+        assert_eq!(once, twice, "smoothing an already-smoothed headerless file changed it");
+    }
+
+    /// Headerless numeric input is smoothed as ids when the caller says so.
+    #[test]
+    fn headerless_id_input_needs_the_flag() {
+        let format = OutputFormat { print_header: false, label_ids: true, ..Default::default() };
+        // Same shape as BODY but in internal ids: B=0, root=3, C=1, miss='-'.
+        let body = "seq1\t0\t100\t0\n\
+                    seq1\t100\t200\t3\n\
+                    seq1\t200\t300\t1\n\
+                    seq2\t0\t50\t-\n\
+                    seq2\t50\t150\t0\n";
+        let out = smooth_to_string(body, &format);
+        // seq1's interior root run sits between cousins B and C, so it is
+        // promoted to their LCA, A(2) -- written as the id, not the name.
+        assert!(out.contains("\t2\n"), "expected the promoted interior as an id, got: {out}");
+        assert!(!out.contains('A'), "ids mode must not emit names: {out}");
+    }
+
+    /// A header describes the file in hand, so it beats a contradictory flag.
+    #[test]
+    fn a_header_overrides_the_flag() {
+        let lying = OutputFormat { print_header: false, label_ids: true, ..Default::default() };
+        let honest = OutputFormat { print_header: false, ..Default::default() };
+        // Would panic parsing "B" as a usize if the flag had been believed.
+        assert_eq!(
+            smooth_to_string(&format!("{HEADER}{BODY}"), &lying),
+            smooth_to_string(&format!("{HEADER}{BODY}"), &honest),
+        );
+    }
+
+    /// The miss token round-trips through a headerless file under a custom label.
+    #[test]
+    fn headerless_input_honours_a_custom_miss_label() {
+        let format = OutputFormat {
+            miss_label: "novel".to_string(),
+            print_header: false,
+            label_ids: false,
+        };
+        // seq2's leading run is a miss and has no neighbour to be promoted
+        // towards, so it must survive as the same token it arrived as.
+        let body = "seq2\t0\t50\tnovel\nseq2\t50\t150\tB\n";
+        let out = smooth_to_string(body, &format);
+        assert!(out.contains("\tnovel\n"), "miss label did not round-trip: {out}");
+        assert!(!out.contains("none"), "leaked the default miss label: {out}");
     }
 }
