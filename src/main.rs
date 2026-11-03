@@ -258,10 +258,10 @@ pub struct LookupQueryArgs {
     #[arg(help = "Output file for the query file given at the same position on the command line. If there is just one query file, this can be left out to write to stdout instead.", short, long)]
     output: Vec<PathBuf>,
 
-    #[arg(help = "Output format. bed: text, one run per line, as above. kst: a karyozip track (.kst), compressed as it is written, with the same rows as the BED; needs --report-misses (a .kst holds gapless runs) and an --output for every query file. Written to a temporary file beside the output and renamed into place when complete.", long = "format", value_enum, default_value_t = OutputFormat::Bed, help_heading = "Output format")]
+    #[arg(help = "Output format. bed: text, one run per line. kst: a karyozip track (.kst), compressed as it is written, with the same rows as the BED; needs --report-misses (a .kst holds gapless runs) and an --output for every query file. Written to a temporary file beside the output and renamed into place when complete.", long = "format", value_enum, default_value_t = OutputFormat::Bed, help_heading = "Output format")]
     format: OutputFormat,
 
-    #[arg(help = "karyozip effort for --format kst, as karyozip -e. low: blocks of 256 Ki runs, fast to write and to query by read. medium: whole-read blocks of about 4 Mi runs, smaller but slower to query by read. [default: low]", long = "kst-effort", value_enum, help_heading = "Output format")]
+    #[arg(help = "karyozip effort for --format kst, as karyozip -e. [default: low]", long = "kst-effort", value_enum, help_heading = "Output format")]
     kst_effort: Option<KstEffort>,
 
     #[arg(help = "With --format kst, also write the names index OUT.kst.kzi beside each output, as `karyozip index` does, for fast queries by read name.", long = "kst-index", help_heading = "Output format")]

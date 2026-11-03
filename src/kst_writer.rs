@@ -13,10 +13,10 @@ use crate::parallel_queries::RunWriter;
 /// is meant for archives, so it is left to the karyozip CLI.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum KstEffort {
-    /// Blocks of 256 Ki runs plus a names index: fast to write, fast to query (karyozip -e low).
+    /// Blocks of 256 Ki runs: fast to write, and a query by read decodes one small block (karyozip -e low).
     #[default]
     Low,
-    /// Whole-read blocks of about 4 Mi runs: smaller, slower single-read queries (karyozip -e medium).
+    /// Whole-read blocks of about 4 Mi runs: smaller, but a query by read decodes a whole block (karyozip -e medium).
     Medium,
 }
 
@@ -75,6 +75,10 @@ impl KstRunWriter {
     /// `.kzi` names index beside it, as `karyozip index` does.
     pub fn finish(mut self, index: bool) -> Result<(), String> {
         if let Some(e) = self.err.take() { return Err(e); }
+        let index_path = match index {
+            true => Some(self.path.to_str().ok_or_else(|| format!("--kst-index needs a UTF-8 output path, got {}", self.path.display()))?.to_string()),
+            false => None,
+        };
         let writer = self.writer.take().expect("finish is called once");
         let tmp = TempOutput::create(&self.path)?;
         let mut out = BufWriter::with_capacity(1 << 21, tmp.file.try_clone().map_err(|e| format!("Could not write {}: {e}", tmp.path.display()))?);
@@ -84,10 +88,9 @@ impl KstRunWriter {
         tmp.commit(&self.path)?;
         log::info!("Wrote {} runs of {} sequences in {} blocks to {}", stats.rows, stats.reads, stats.blocks, self.path.display());
 
-        if index {
-            let p = self.path.to_str().ok_or_else(|| format!("--kst-index needs a UTF-8 output path, got {}", self.path.display()))?;
+        if let Some(p) = index_path {
             let opts = karyozip::reader::ReadOpts { index: true, ..Default::default() };
-            karyozip::reader::Reader::open_with(p, &opts).build_index(p);
+            karyozip::reader::Reader::open_with(&p, &opts).build_index(&p);
         }
         Ok(())
     }
