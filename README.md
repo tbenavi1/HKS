@@ -180,7 +180,35 @@ Options:
 Advanced:
       --batch-size <BATCH_SIZE>  Number of bases processed per batch in parallel query execution. Increasing this value increases RAM usage but may improve query time and/or parallelism. [default: 1000000]
       --report-label-ids         Report internal label id integers instead of label names. This might save a lot of space if the labels are long. Use --print-hierarchy to print the internal ids.
+
+Output format:
+      --format <FORMAT>          Output format. bed: text, one run per line. kst: a karyozip track (.kst), compressed as it is written, with the same rows as the BED; needs --report-misses (a .kst holds gapless runs) and an --output for every query file. Written to a temporary file beside the output and renamed into place when complete. [default: bed] [possible values: bed, kst]
+      --kst-effort <KST_EFFORT>  karyozip effort for --format kst, as karyozip -e. [default: low] [possible values: low, medium]
+      --kst-index                With --format kst, also write the names index OUT.kst.kzi beside each output, as `karyozip index` does, for fast queries by read name.
 ```
+
+### Output as a karyozip track (`--format kst`)
+
+With `--format kst`, `hks lookup` writes each output as a [karyozip](https://github.com/AndreaGuarracino/karyozip) track (`.kst`) instead of text. The runs are compressed as they are produced, so no BED is ever written, read back or kept on disk. The file holds exactly the rows `--format bed` would print: the same query names (with `--report-query-names`) or ranks, the same label names (or ids, with `--report-label-ids`) and the same miss label. It is byte-identical to compressing that BED with `karyozip -e <effort> compress`, and `karyozip decompress` gives the BED back.
+
+```bash
+hks lookup \
+    -i base.hksb --feature-set-file features.hksf -k 5 \
+    --report-query-names --report-misses \
+    -q example/query.fasta \
+    --format kst -o query.kst
+
+karyozip decompress -i query.kst          # the BED, as --format bed with --no-header prints it
+karyozip query -i query.kst -r Q2:0-10    # the runs of one query sequence
+```
+
+- `--report-misses` is required: a `.kst` holds every run of a sequence, gapless from 0, so the runs of k-mers not found in the index must be written too. They get the `--miss-label` label.
+- Every query file needs its own `--output`, also with several `-q`/`-o` pairs. A `.kst` is not written to stdout. There is no header line, so `--no-header` makes no difference.
+- `--kst-effort low` (the default) writes blocks of 256 Ki runs. It is quick to write, and a query by read name decodes one small block. `--kst-effort medium` writes whole-read blocks of about 4 Mi runs. The file is smaller, but a query by read name decodes a whole block. These are karyozip's `-e low` and `-e medium`.
+- `--kst-index` also writes the names index `OUT.kst.kzi`, as `karyozip index -i OUT.kst` does. It makes queries by read name fast on tracks with many reads.
+- Each file is written to a temporary file beside the output and renamed into place when it is complete. A failed run leaves any earlier file at that path as it was. karyozip's staging file for the blocks also lives in the output's directory, and it is unlinked as soon as it is created.
+
+Building hks needs a clone of karyozip, because its `build.rs` compiles the C codecs from the clone. `Cargo.toml` points at the crate directory (`rust/`) of that clone. It also needs gcc, g++ and libgomp.
 
 ### Hierarchy file format
 
