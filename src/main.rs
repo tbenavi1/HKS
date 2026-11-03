@@ -8,6 +8,7 @@ use jseqio::{reader::DynamicFastXReader, record::Record};
 use sbwt::{BitPackedKmerSortingDisk, BitPackedKmerSortingMem, LcsArray, SbwtIndex, SbwtIndexVariant, SubsetMatrix, write_sbwt_index_variant};
 use single_colored_kmers::{ColorHierarchy, Labeling, HksIndex};
 use parallel_queries::{MissPolicy, OutputWriter};
+use kst_writer::{KstEffort, KstRunWriter};
 
 use crate::{color_storage::SimpleColorStorage, parallel_queries::RunWriter, single_colored_kmers::{HksBase, LcsWrapper, SingleColoredKmersShort}, traits::{ColorStorage, ColoredKmerLookupAlgorithm}};
 
@@ -24,6 +25,7 @@ mod wavelet_tree;
 mod traits;
 mod color_storage;
 mod smooth;
+mod kst_writer;
 
 type FixedKColorIndex = HksIndex<LcsWrapper, SimpleColorStorage>;
 type ShortKColorIndex = SingleColoredKmersShort<LcsWrapper, SimpleColorStorage>;
@@ -255,11 +257,38 @@ pub struct LookupQueryArgs {
 
     #[arg(help = "Output file for the query file given at the same position on the command line. If there is just one query file, this can be left out to write to stdout instead.", short, long)]
     output: Vec<PathBuf>,
+
+    #[arg(help = "Output format. bed: text, one run per line, as above. kst: a karyozip track (.kst), compressed as it is written, with the same rows as the BED; needs --report-misses (a .kst holds gapless runs) and an --output for every query file. Written to a temporary file beside the output and renamed into place when complete.", long = "format", value_enum, default_value_t = OutputFormat::Bed, help_heading = "Output format")]
+    format: OutputFormat,
+
+    #[arg(help = "karyozip effort for --format kst, as karyozip -e. low: blocks of 256 Ki runs, fast to write and to query by read. medium: whole-read blocks of about 4 Mi runs, smaller but slower to query by read. [default: low]", long = "kst-effort", value_enum, help_heading = "Output format")]
+    kst_effort: Option<KstEffort>,
+
+    #[arg(help = "With --format kst, also write the names index OUT.kst.kzi beside each output, as `karyozip index` does, for fast queries by read name.", long = "kst-index", help_heading = "Output format")]
+    kst_index: bool,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputFormat {
+    Bed,
+    Kst,
 }
 
 impl LookupQueryArgs {
     // Pairs each query file with the output file it is written to, or with None for stdout.
+    // Also checks the output format options against the rest, so that a bad combination
+    // is reported before the index is loaded.
     fn query_output_pairs(&self) -> Result<Vec<(&PathBuf, Option<&PathBuf>)>, String> {
+        if self.format == OutputFormat::Kst {
+            if !self.report_misses {
+                return Err("--format kst needs --report-misses: a .kst track holds every run of a sequence, gapless from 0, so the runs of k-mers not found in the index must be written too (with --miss-label, or the default miss label).".to_string());
+            }
+            if self.output.is_empty() {
+                return Err("--format kst needs --output: a .kst is not written to stdout.".to_string());
+            }
+        } else if self.kst_effort.is_some() || self.kst_index {
+            return Err("--kst-effort and --kst-index need --format kst.".to_string());
+        }
         if self.output.is_empty() {
             // Writing several query files to stdout would interleave their runs into
             // a single stream with no way to tell which query file a run came from.
@@ -490,9 +519,30 @@ fn run_lookup_with_args(index: &ShortKColorIndex, n_threads: usize, args: &Looku
 
     let algo = LookupAlgorithmImpl { index };
 
-    for (query, output) in args.query_output_pairs()? {
+    let pairs = args.query_output_pairs()?;
+    if args.format == OutputFormat::Kst {
+        // karyozip compresses with rayon's global pool and with OpenMP in its codecs:
+        // both are kept to the lookup's thread count. A pool built earlier stays.
+        let _ = rayon::ThreadPoolBuilder::new().num_threads(n_threads).build_global();
+        karyozip::ffi::omp_threads(n_threads);
+    }
+
+    for (query, output) in pairs {
         let seq_names = if args.report_query_names { Some(load_seq_names(query)?) } else { None };
         let reader = open_fastx(query)?;
+
+        if args.format == OutputFormat::Kst {
+            let path = output.expect("checked by query_output_pairs");
+            let MissPolicy::ReportMisses{label: miss_label} = &misses else { unreachable!("checked by query_output_pairs") };
+            let n_colors = index.inner().labeling().hierarchy.n_nodes();
+            let mut writer = KstRunWriter::new(path, seq_names, color_names.as_deref(), n_colors, miss_label, args.kst_effort.unwrap_or_default())?;
+            log::info!("Running queries from {} ...", query.display());
+            let query_start = std::time::Instant::now();
+            run_queries(n_threads, reader, &algo, args.batch_size as usize, k, &mut writer);
+            writer.finish(args.kst_index)?;
+            log::info!("Queries from {} finished in {:.2} s ({n_threads} threads), written to {}", query.display(), query_start.elapsed().as_secs_f64(), path.display());
+            continue;
+        }
 
         // A dynamic writer is fine performance-wise because it's wrapped in a buffered writer.
         let out: Box<dyn Write + Send> = if let Some(path) = output {
