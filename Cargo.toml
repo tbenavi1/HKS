@@ -29,8 +29,8 @@ rayon = "1.11.0"
 bitvec_sds = {path = "./bitvec_sds", version = "=0.1.0"}
 bincode = "1.3.0"
 bytemuck = "1.25.0"
-# For lookup --format kst. A path to the crate directory of a karyozip clone: its
-# build.rs compiles the C codecs from ../c, so it builds from a clone only (it is
-# publish = false). Needs gcc, g++ and libgomp.
-karyozip = {path = "../../karyozip-work/wt/integration/rust"}
+# For lookup --format kst: karyozip 0.3.0, from its git tag (the crate lives in rust/ of
+# that repository; its build.rs compiles the C codecs from ../c, so it is not on crates.io).
+# Needs gcc, g++ and libgomp.
+karyozip = {git = "https://github.com/AndreaGuarracino/karyozip", tag = "v0.3.0"}
 

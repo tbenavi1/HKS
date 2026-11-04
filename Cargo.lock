@@ -699,7 +699,8 @@ dependencies = [
 
 [[package]]
 name = "karyozip"
-version = "0.2.0"
+version = "0.3.0"
+source = "git+https://github.com/AndreaGuarracino/karyozip?tag=v0.3.0#8ba8e92327faa472c97b57efdaccf3aeaaf8cde9"
 dependencies = [
  "cc",
  "flate2",
