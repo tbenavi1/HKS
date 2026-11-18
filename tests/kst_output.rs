@@ -202,6 +202,23 @@ fn kst_index_matches_karyozip_index() {
 }
 
 #[test]
+fn kst_index_is_written_for_every_query_after_all_lookups() {
+    let out = lookup(&["--report-misses", "--report-query-names", "--format", "kst", "--kst-index",
+        "-q", "q1.fa", "-o", "mix1.kst", "-q", "q2.fa", "-o", "mix2.kst"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "hks lookup failed:\n{err}");
+    // Each .kzi is the one a single-query run writes
+    for (batch, single, query) in [("mix1.kst", "mixs1.kst", "q1.fa"), ("mix2.kst", "mixs2.kst", "q2.fa")] {
+        lookup_ok(&["--report-misses", "--report-query-names", "--format", "kst", "--kst-index", "-q", query, "-o", single]);
+        assert!(read(&format!("{batch}.kzi")) == read(&format!("{single}.kzi")), "{batch}.kzi differs from a single-query run");
+    }
+    // No .kzi is built while the k-mer index is loaded: every lookup finishes first
+    let last_query = err.rfind("Queries from").expect("no query log line");
+    let first_kzi = err.find("Writing the names index").expect("no names index log line");
+    assert!(last_query < first_kzi, "a .kzi was built before the last lookup finished:\n{err}");
+}
+
+#[test]
 fn kst_refuses_without_report_misses() {
     let out = lookup(&["--format", "kst", "-q", "q2.fa", "-o", "refused.kst"]);
     assert!(!out.status.success());
