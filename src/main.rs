@@ -8,7 +8,7 @@ use jseqio::{reader::DynamicFastXReader, record::Record};
 use sbwt::{BitPackedKmerSortingDisk, BitPackedKmerSortingMem, LcsArray, SbwtIndex, SbwtIndexVariant, SubsetMatrix, write_sbwt_index_variant};
 use single_colored_kmers::{ColorHierarchy, Labeling, HksIndex};
 use parallel_queries::{MissPolicy, OutputWriter};
-use kst_writer::{KstEffort, KstRunWriter};
+use kst_writer::{build_kzi, KstEffort, KstRunWriter};
 
 use crate::{color_storage::SimpleColorStorage, parallel_queries::RunWriter, single_colored_kmers::{HksBase, LcsWrapper, SingleColoredKmersShort}, traits::{ColorStorage, ColoredKmerLookupAlgorithm}};
 
@@ -501,7 +501,10 @@ fn run_queries<A: ColoredKmerLookupAlgorithm + Send + Sync, W: RunWriter>(n_thre
 }
 
 // Runs every query file against the index in turn, each into its own output file.
-fn run_lookup_with_args(index: &ShortKColorIndex, n_threads: usize, args: &LookupQueryArgs) -> Result<(), String> {
+// Returns the .kst outputs whose .kzi names index is still to be written (--kst-index):
+// the caller builds them with `build_kzi` once it no longer needs the k-mer index, so
+// that the two never share memory (index ~10 GB for human + build_index ~30 B/sequence).
+fn run_lookup_with_args(index: &ShortKColorIndex, n_threads: usize, args: &LookupQueryArgs) -> Result<Vec<String>, String> {
     let k = index.query_k();
     let color_names: Option<Vec<String>> = if args.report_label_ids {
         None
@@ -527,6 +530,7 @@ fn run_lookup_with_args(index: &ShortKColorIndex, n_threads: usize, args: &Looku
         karyozip::ffi::omp_threads(n_threads);
     }
 
+    let mut pending_kzi = Vec::new();
     for (query, output) in pairs {
         let seq_names = if args.report_query_names { Some(load_seq_names(query)?) } else { None };
         let reader = open_fastx(query)?;
@@ -539,7 +543,7 @@ fn run_lookup_with_args(index: &ShortKColorIndex, n_threads: usize, args: &Looku
             log::info!("Running queries from {} ...", query.display());
             let query_start = std::time::Instant::now();
             run_queries(n_threads, reader, &algo, args.batch_size as usize, k, &mut writer);
-            writer.finish(args.kst_index)?;
+            pending_kzi.extend(writer.finish(args.kst_index)?);
             log::info!("Queries from {} finished in {:.2} s ({n_threads} threads), written to {}", query.display(), query_start.elapsed().as_secs_f64(), path.display());
             continue;
         }
@@ -560,7 +564,7 @@ fn run_lookup_with_args(index: &ShortKColorIndex, n_threads: usize, args: &Looku
         run_queries(n_threads, reader, &algo, args.batch_size as usize, k, writer);
         log::info!("Queries from {} finished in {:.2} s ({n_threads} threads)", query.display(), query_start.elapsed().as_secs_f64());
     }
-    Ok(())
+    Ok(pending_kzi)
 }
 
 fn run_prompt_loop(index: &ShortKColorIndex, n_threads: usize) {
@@ -580,7 +584,12 @@ fn run_prompt_loop(index: &ShortKColorIndex, n_threads: usize) {
         if matches!(trimmed, "quit" | "exit" | "q") { break; }
         let tokens = std::iter::once("prompt").chain(trimmed.split_whitespace());
         match LookupQueryArgs::try_parse_from(tokens) {
-            Ok(args) => if let Err(e) = run_lookup_with_args(index, n_threads, &args) { eprintln!("Error: {e}"); },
+            // The session keeps its index for the next command, so here the .kzi is
+            // built with the index still loaded.
+            Ok(args) => match run_lookup_with_args(index, n_threads, &args) {
+                Ok(pending_kzi) => pending_kzi.iter().for_each(|p| build_kzi(p)),
+                Err(e) => eprintln!("Error: {e}"),
+            },
             Err(e) => eprintln!("{e}"),
         }
     }
@@ -882,7 +891,11 @@ fn main() {
             let n_threads = n_threads as usize;
             // Constructor does extra preprocessing if k < index.k()
             let index = ShortKColorIndex::new(index, k, n_threads);
-            run_lookup_with_args(&index, n_threads, &query_args).unwrap_or_else(|e| panic!("{e}"));
+            let pending_kzi = run_lookup_with_args(&index, n_threads, &query_args).unwrap_or_else(|e| panic!("{e}"));
+            // Free the k-mer index before building any .kzi names index: the two
+            // together ran a 30x WGS read set out of memory (see build_kzi).
+            drop(index);
+            pending_kzi.iter().for_each(|p| build_kzi(p));
         },
 
         Subcommands::Prompt { index: index_path, labeling_file, k, n_threads } => {

@@ -71,9 +71,10 @@ impl KstRunWriter {
 
     /// Writes the track: into a temporary file beside the output, renamed over it only
     /// once it is complete and synced. On failure the temporary file is removed and any
-    /// earlier file at the output path is left as it was. With `index`, also writes the
-    /// `.kzi` names index beside it, as `karyozip index` does.
-    pub fn finish(mut self, index: bool) -> Result<(), String> {
+    /// earlier file at the output path is left as it was. With `index`, returns the
+    /// output path for `build_kzi`, which the caller runs only once the k-mer index is
+    /// freed (see there); the path is checked here so that a bad one fails early.
+    pub fn finish(mut self, index: bool) -> Result<Option<String>, String> {
         if let Some(e) = self.err.take() { return Err(e); }
         let index_path = match index {
             true => Some(self.path.to_str().ok_or_else(|| format!("--kst-index needs a UTF-8 output path, got {}", self.path.display()))?.to_string()),
@@ -88,11 +89,7 @@ impl KstRunWriter {
         tmp.commit(&self.path)?;
         log::info!("Wrote {} runs of {} sequences in {} blocks to {}", stats.rows, stats.reads, stats.blocks, self.path.display());
 
-        if let Some(p) = index_path {
-            let opts = karyozip::reader::ReadOpts { index: true, ..Default::default() };
-            karyozip::reader::Reader::open_with(&p, &opts).build_index(&p);
-        }
-        Ok(())
+        Ok(index_path)
     }
 
     fn row(&mut self, seq_id: isize, label: Option<usize>, range: Range<usize>) -> Result<(), String> {
@@ -124,6 +121,17 @@ impl RunWriter for KstRunWriter {
     }
 
     fn flush(&mut self) {} // Everything is written by finish()
+}
+
+/// Writes the `.kzi` names index beside the `.kst` at `path`, as `karyozip index` does.
+///
+/// Called only after the k-mer index is dropped: karyozip's `build_index` holds about
+/// 30 B per sequence in memory, so on a 30x WGS read set (~800 M reads) it needs some
+/// 25 GB on its own, and stacked on a human k-mer index (~10 GB) it ran out of memory.
+pub fn build_kzi(path: &str) {
+    log::info!("Writing the names index {path}.kzi ...");
+    let opts = karyozip::reader::ReadOpts { index: true, ..Default::default() };
+    karyozip::reader::Reader::open_with(path, &opts).build_index(path);
 }
 
 fn parent_dir(path: &Path) -> PathBuf {
